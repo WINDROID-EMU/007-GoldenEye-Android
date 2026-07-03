@@ -46,3 +46,24 @@ The recompiled code keeps original PPC asm as comments — grep those.
 The desktop binary is **`out/build/linux-amd64-relwithdebinfo/GoldenEye`**
 (CMake `OUTPUT_NAME "GoldenEye"`), NOT `ge`. `CLAUDE.md`'s run recipe says `ge`
 and is wrong.
+
+## Findings 2026-07 (runtime trace + static walk-up) — ENTRY IDENTIFIED
+- **Correction to the trail above:** `sub_820A7508`'s `r4` is the **raw weapon id**, NOT a
+  resolved object (verified live: obj=0x01/0x05/0x11 = the held ids during digit switches).
+- All native switches funnel through ONE applier call site `lr=0x820AC1C8` inside
+  `sub_820AAE00` (the weapon state machine), which reads the target from a per-hand
+  "desired weapon" field — a heap struct, which is why fixed-address scans never found it:
+  `hand_struct = *(0x82F1FAAC) + hand*936`; fields: +2344 current id, +2404 desired id,
+  +2384 switch-state (5 = start), +2412 aux (0 on request), +0x94C/+0x950 state counters.
+- **Direct-switch entry: `sub_820A6F70` (guest 0x820A6F70), args r3 = hand, r4 = weapon id,
+  r5 = 1 (direction/mode).** Sole funnel for the Y-cycle input paths (input dispatcher
+  `sub_820B99E8` -> 4 cycle helpers -> 8 call sites total). Dedups repeated requests and
+  refuses to restart an in-flight switch.
+- Forcing alternative one level down: `sub_820A0CF8` (r3=hand, r4=id) = pure 3-store leaf,
+  equivalent to `[H+2404]=id; [H+2412]=0; [H+2384]=5` (write 2384 last). Writing +2404
+  alone does nothing.
+- Confidence: high on formula/protocol (writer enumeration was exhaustive); medium on
+  ownership validation (the entry does NOT check the weapon is held — callers do; our
+  driver guard covers this). Live confirmation = the Phase-2 `equip` harness.
+- Full evidence trail (file:line, guest addresses): `.superpowers/sdd/task-3-analysis.md`
+  (git-ignored scratch; regenerate from generated/ if needed).
