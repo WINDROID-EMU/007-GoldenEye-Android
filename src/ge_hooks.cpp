@@ -1487,6 +1487,10 @@ REXCVAR_DEFINE_STRING(ge_key_dleft, "Left", "Input/Keybinds", "D-pad left");
 REXCVAR_DEFINE_STRING(ge_key_dright, "Right", "Input/Keybinds", "D-pad right");
 REXCVAR_DEFINE_STRING(ge_key_start, "Return", "Input/Keybinds", "Start button");
 REXCVAR_DEFINE_STRING(ge_key_back, "Tab", "Input/Keybinds", "Back button");
+REXCVAR_DEFINE_BOOL(ge_weapon_select_enable, true, "Input",
+                    "Number keys 1-9 / scrollwheel select carried weapons");
+REXCVAR_DEFINE_STRING(ge_key_wpn_next, "WheelUp", "Input/Keybinds", "Next carried weapon");
+REXCVAR_DEFINE_STRING(ge_key_wpn_prev, "WheelDown", "Input/Keybinds", "Previous carried weapon");
 
 // Runs once per controller poll, after XamInputGetState fills the slot-0 buffer
 // and before the guest dispatches it. OR our keyboard buttons in, and set the
@@ -1601,26 +1605,46 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   if (lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(lx));
   if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
 
-  // TEMP (Task 1 verification, removed in Task 2): press N to request the next
-  // carried weapon; the driver above cycles Y to reach it. Disabled for the
-  // prerelease (the real scrollwheel/number input driver lands in Task 2); the
-  // second-screen weapon menu already drives switching via RequestEquipWeapon.
-#if 0
-  {
-    static bool prev_n = false;
-    const bool n = g_listener.key_down(rex::ui::VirtualKey::kN);
-    if (n && !prev_n) {
-      const auto snap = ge::gamestate::GetWeaponSnapshot();
-      if (snap.valid && snap.held_count > 0) {
+  // Weapon selection: digits 1-9 jump straight to the Nth carried weapon, and
+  // the scrollwheel steps next/prev through the carried list. Edge-triggered so
+  // a held key posts exactly one request. Actuation happens in the driver
+  // above (which walks or direct-calls the game to the target), so this block
+  // only ever posts RequestEquipWeapon.
+  if (REXCVAR_GET(ge_weapon_select_enable)) {
+    static rex::ui::VirtualKey digit_vk[9] = {};
+    static bool vk_init = false;
+    if (!vk_init) {
+      vk_init = true;
+      const char* names[9] = {"1", "2", "3", "4", "5", "6", "7", "8", "9"};
+      for (int i = 0; i < 9; ++i) digit_vk[i] = rex::ui::ParseVirtualKey(names[i]);
+    }
+    static uint16_t prev_digits = 0;
+    static bool prev_next = false, prev_prev = false;
+    const auto snap = ge::gamestate::GetWeaponSnapshot();
+    if (snap.valid && snap.held_count > 0) {
+      uint16_t digits = 0;
+      for (int i = 0; i < 9; ++i)
+        if (g_listener.key_down(digit_vk[i])) digits |= (uint16_t)(1u << i);
+      for (int i = 0; i < 9 && i < snap.held_count; ++i)
+        if ((digits & (1u << i)) && !(prev_digits & (1u << i)))
+          ge::gamestate::RequestEquipWeapon(snap.held_ids[i]);
+      prev_digits = digits;
+
+      const bool next = ge_key_down("ge_key_wpn_next");
+      const bool prev = ge_key_down("ge_key_wpn_prev");
+      if ((next && !prev_next) || (prev && !prev_prev)) {
         int idx = 0;
         for (int i = 0; i < snap.held_count; ++i)
           if (snap.held_ids[i] == snap.equipped_id) { idx = i; break; }
-        ge::gamestate::RequestEquipWeapon(snap.held_ids[(idx + 1) % snap.held_count]);
+        const int step = (next && !prev_next) ? 1 : -1;
+        const int n = (idx + step + snap.held_count) % snap.held_count;
+        ge::gamestate::RequestEquipWeapon(snap.held_ids[n]);
       }
+      prev_next = next; prev_prev = prev;
+    } else {
+      prev_digits = 0; prev_next = false; prev_prev = false;
     }
-    prev_n = n;
   }
-#endif
 }
 
 // ===========================================================================
