@@ -122,12 +122,16 @@ Per-frame flow in the guest-thread driver (`ge_hooks.cpp`); the request API stay
 3. If cvar `ge_weapon_direct_switch` (default **on**) and the Phase 1 entry exists:
    resolve target if needed, call the guest function, confirm via the equipped-id
    snapshot.
-4. **Fallback:** if the equipped id is unchanged after a confirm window
-   (~30 frames), or the entry was never discovered/compiled out, downgrade that
-   same request to the existing Y-cycle driver. The request is not lost. Log one
-   line per downgrade so degradation is never silent.
+4. **Retry, then give up (AMENDED during implementation, user-approved):** the
+   Phase-2 matrix showed the guest entry silently DROPS requests made while the
+   player is mid-action (e.g. firing) — and a native Y press is equally ignored
+   then, so downgrading to Y-cycle adds nothing. Shipped behavior: if the
+   equipped id is unchanged after a confirm window (~30 frames), RE-ISSUE the
+   direct call (the entry dedups, so repeats are safe), up to 10 tries, then
+   give up and clear the request with one log line. The Y-cycle driver survives
+   intact but is reachable ONLY via `ge_weapon_direct_switch=false`.
 
-The Y-cycle code is kept as-is (no refactor) — the fallback stays boring.
+The Y-cycle code is kept as-is (no refactor) — the escape hatch stays boring.
 `ge_weapon_direct_switch=false` is the A/B lever and per-device escape hatch.
 
 ## Error handling summary
