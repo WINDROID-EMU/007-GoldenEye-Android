@@ -1531,7 +1531,7 @@ void ge_mouse_camera(uint8_t* base);  // defined above
 void ge_apply_ce_data_patches(uint8_t* base);  // ge_ce_patches.cpp
 // Phase-2 verification harness (defined below, next to the discovery hook, so
 // it can share dbg_safe_ld32). See docs/HANDOFF-weapon-switch-direct-call.md.
-bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id);
+bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id, int32_t hand);
 
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // Attach the input listener from the controller-poll path too. InitMouseLook()
@@ -1570,8 +1570,9 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // command channel fires ONE direct switch, bypassing RequestEquipWeapon, so
   // the guest call can be exercised and observed in isolation. Diag-only.
   if (REXCVAR_GET(ge_gamestate_diag)) {
-    const int32_t direct = ge::gamestate::TakeDirectEquip();
-    if (direct != ge::gamestate::kNoWeapon) ge_direct_equip(ctx, base, direct);
+    int32_t hand = 0;
+    const int32_t direct = ge::gamestate::TakeDirectEquip(&hand);
+    if (direct != ge::gamestate::kNoWeapon) ge_direct_equip(ctx, base, direct, hand);
   }
 
   // Weapon actuation: step the game's native Y (weapon-switch) input toward the
@@ -1754,22 +1755,23 @@ void ge_dbg_weapon_apply(PPCRegister& r3, PPCRegister& r4) {
 // from ctx after we return -- a guest call here clobbers volatile
 // registers/lr otherwise.
 // ===========================================================================
-bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id) {
+bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id, int32_t hand) {
   const int32_t before = (int32_t)dbg_safe_ld32(base, 0x447f10b0u);  // equipped-id block
   const PPCContext saved = *ctx;
 
   // sub_820A6F70(hand, weapon id, direction/mode) -- the sole funnel for the
-  // native Y-cycle input paths (Findings 2026-07). r3 = hand (0 = main hand),
+  // native Y-cycle input paths (Findings 2026-07). r3 = hand (0 = main hand,
+  // 1 = off hand -- diag harness arg, used to probe dual-wield behavior),
   // r4 = raw weapon id, r5 = 1 (direction/mode constant observed on all
   // native call sites).
-  ctx->r3.u32 = 0;                        // hand 0 (main hand)
+  ctx->r3.u32 = (uint32_t)hand;           // hand (0 = main hand, 1 = off hand)
   ctx->r4.u32 = (uint32_t)weapon_id;      // raw weapon id (verified: applier takes ids)
   ctx->r5.u32 = 1;                        // direction/mode; constant 1 on all native paths
   sub_820A6F70(*ctx, base);
 
   *ctx = saved;
-  REXKRNL_INFO("GEWPN direct equip id={} equip_before={} equip_after={}",
-               weapon_id, before, (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
+  REXKRNL_INFO("GEWPN direct equip id={} hand={} equip_before={} equip_after={}",
+               weapon_id, hand, before, (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
   return true;  // wired; return false above if left unimplemented
 }
 

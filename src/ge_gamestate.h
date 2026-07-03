@@ -97,13 +97,15 @@ void RequestEquipWeapon(int32_t weapon_id);
 int32_t PeekEquipRequest();
 void ClearEquipRequest();
 
-// Diag-only (Phase-2 verification harness): post a weapon id for the driver to
-// switch to via ONE direct guest call, bypassing the RequestEquipWeapon walk.
-// TakeDirectEquip returns-and-clears the pending id (kNoWeapon if none).
-// Callable from any thread. No-ops in normal play (only the memscan `equip`
-// command posts).
-void PostDirectEquip(int32_t weapon_id);
-int32_t TakeDirectEquip();
+// Diag-only (Phase-2 verification harness): post a weapon id + hand for the
+// driver to switch to via ONE direct guest call, bypassing the
+// RequestEquipWeapon walk. `hand` is the raw hand argument passed to the
+// guest call (0/1; used to probe dual-wield behavior). TakeDirectEquip
+// returns-and-clears the pending id (kNoWeapon if none) and writes the
+// paired hand out through `hand_out`. Callable from any thread. No-ops in
+// normal play (only the memscan `equip` command posts).
+void PostDirectEquip(int32_t weapon_id, int32_t hand);
+int32_t TakeDirectEquip(int32_t* hand_out);
 
 // Game-thread per-frame pump. Reads guest memory and publishes a fresh
 // snapshot. (Equip actuation does NOT happen here -- see the driver in
