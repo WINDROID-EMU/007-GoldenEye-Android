@@ -1062,6 +1062,17 @@ class GameInputListener final : public rex::ui::WindowInputListener,
     return key_down_[idx];
   }
 
+  // Decay the wheel pulse armed by OnMouseWheel into key_down_, once per game
+  // frame (called from ge_inject_keyboard, not from key_down() itself, which is
+  // polled multiple times per frame and would double-decrement the pulse).
+  void tick_wheel() {
+    std::lock_guard<std::mutex> l(m_);
+    key_down_[static_cast<uint16_t>(rex::ui::VirtualKey::kMouseWheelUp)] = wheel_up_frames_ > 0;
+    key_down_[static_cast<uint16_t>(rex::ui::VirtualKey::kMouseWheelDown)] = wheel_down_frames_ > 0;
+    if (wheel_up_frames_ > 0) --wheel_up_frames_;
+    if (wheel_down_frames_ > 0) --wheel_down_frames_;
+  }
+
   bool focused() const { return window_ && window_->HasFocus(); }
   bool suppressed() const { return suppressed_.load(std::memory_order_relaxed); }
 
@@ -1120,6 +1131,17 @@ class GameInputListener final : public rex::ui::WindowInputListener,
   void OnMouseUp(rex::ui::MouseEvent& e) override { set_mouse_button(e.button(), false); }
   void OnKeyDown(rex::ui::KeyEvent& e) override { set_key(e.virtual_key(), true); }
   void OnKeyUp(rex::ui::KeyEvent& e) override { set_key(e.virtual_key(), false); }
+  // Wheel notches are edge-only (one callback per detent, no held state at the
+  // window layer -- see rex::ui::WindowInputListener::OnMouseWheel). Arm a short
+  // pulse here; tick_wheel() decays it into key_down_ once per game frame, the
+  // same pattern rexglue's MnkInputDriver uses (mnk_wheel_pulse_frames, default
+  // 2) for its own polled key table.
+  void OnMouseWheel(rex::ui::MouseEvent& e) override {
+    std::lock_guard<std::mutex> l(m_);
+    constexpr int kPulseFrames = 2;  // matches mnk_wheel_pulse_frames default
+    if (e.scroll_y() > 0) wheel_up_frames_ = kPulseFrames;
+    else if (e.scroll_y() < 0) wheel_down_frames_ = kPulseFrames;
+  }
 
   // WindowListener: drop held keys / queued motion on focus loss (no stuck keys
   // or view snap on alt-tab). Capture itself auto-releases via tick_capture.
@@ -1127,6 +1149,7 @@ class GameInputListener final : public rex::ui::WindowInputListener,
     std::lock_guard<std::mutex> l(m_);
     std::memset(key_down_, 0, sizeof(key_down_));
     dx_ = 0.f; dy_ = 0.f; have_prev_ = false; raw_motion_ = false;
+    wheel_up_frames_ = 0; wheel_down_frames_ = 0;
   }
 
  private:
@@ -1160,6 +1183,7 @@ class GameInputListener final : public rex::ui::WindowInputListener,
   bool captured_ = false;
   std::atomic<bool> suppressed_{false};  // true while the pause menu is open
   bool key_down_[256] = {};
+  int wheel_up_frames_ = 0, wheel_down_frames_ = 0;  // armed by OnMouseWheel, decayed by tick_wheel()
 };
 
 GameInputListener g_listener;
@@ -1529,6 +1553,10 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // live in the now-removed ge_mouselook_pitch hook; ge_ensure_listener already
   // ran at the top of this function).
   g_listener.tick_capture();
+  // Decay any wheel pulse armed by OnMouseWheel into key_down_ this frame (see
+  // GameInputListener::tick_wheel()) -- must run once per frame, same cadence
+  // the weapon-select block below polls kMouseWheelUp/Down at.
+  g_listener.tick_wheel();
   if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
 
   // Weapon actuation: step the game's native Y (weapon-switch) input toward the
