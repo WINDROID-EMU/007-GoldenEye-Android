@@ -209,6 +209,10 @@ extern "C" uint32_t rex_ge_cp_wait_reg_mem_timeouts();
 // ring is non-empty = the CP worker isn't getting scheduled (starvation).
 extern "C" uint64_t rex_ge_cp_progress_seq();
 
+// Discovery diagnostic toggle, defined in ge_gamestate.cpp:87. Declared here so
+// ge_dbg_weapon_apply (below) can gate its logging without a header dependency.
+REXCVAR_DECLARE(bool, ge_gamestate_diag);
+
 // CP-starvation episodes observed by the watchdog (ring non-empty but the CP
 // progress seq did not advance across a 250ms watchdog tick). Coarse by design
 // -- fine-grained starvation shows up as missing time in the per-frame CP
@@ -1645,6 +1649,29 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
       prev_digits = 0; prev_next = false; prev_prev = false;
     }
   }
+}
+
+// ===========================================================================
+// Phase-1 discovery hook (weapon direct-switch RE; spec:
+// docs/superpowers/specs/2026-07-03-weapon-direct-switch-design.md). Entry of
+// sub_820A7508, the per-hand weapon applier -- the known bottom of the switch
+// call chain. Logs the guest caller (lr) and args so a pause-menu inventory
+// selection can be diffed against a Y-cycle switch: the first lr unique to
+// the pause-menu path identifies the direct-switch caller. Inert unless
+// ge_gamestate_diag is set (desktop RE sessions only).
+// ===========================================================================
+void ge_dbg_weapon_apply(PPCRegister& r3, PPCRegister& r4) {
+  if (!REXCVAR_GET(ge_gamestate_diag)) return;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  const uint32_t obj = r4.u32;
+  uint32_t w[4] = {0, 0, 0, 0};
+  if (obj) for (int i = 0; i < 4; ++i) w[i] = LD32(base, obj + 4u * i);
+  // 0x447f10b0 = equipped-id block (kEquipIdAddr in ge_gamestate.cpp); only
+  // read here, inside the applier, when it is guaranteed live.
+  REXKRNL_INFO("GEWPNAPPLY lr={:#010x} hand={} obj={:#010x} "
+               "obj[0..3]={:#010x},{:#010x},{:#010x},{:#010x} equip={}",
+               (uint32_t)ctx->lr, r3.u32, obj, w[0], w[1], w[2], w[3],
+               (int32_t)LD32(base, 0x447f10b0u));
 }
 
 // ===========================================================================
