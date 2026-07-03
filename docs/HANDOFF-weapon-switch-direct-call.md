@@ -74,3 +74,18 @@ and is wrong.
   driver guard covers this). Live confirmation = the Phase-2 `equip` harness.
 - Full evidence trail (file:line, guest addresses): `.superpowers/sdd/task-3-analysis.md`
   (git-ignored scratch; regenerate from generated/ if needed).
+
+### Known limitations (2026-07-03)
+- The direct-call path derives its hand structs from `GE_BONDVIEW_CUR`
+  (0x82F1FAAC), which cycles across all players each frame in a network MP
+  session (the same reason mouse-look migrated to a viewport scan — see
+  `ge_hooks.cpp` ~1320). Network MP sessions are guarded off of the direct path
+  via `GE_NET_FLAG` (byte @0x830CAEA0, !=0 = network MP session) and routed to
+  the pad-injection Y-cycle walker instead, which is player-0-safe by
+  construction.
+- Local splitscreen is **not** detected by `GE_NET_FLAG` and is **untested**
+  with the direct path. If wrong-player weapon switches are reported in
+  splitscreen, the fix is the same viewport-scan player guard idiom already
+  used by mouse-look (`ge_hooks.cpp` ~1320): resolve the acting hand from the
+  active-viewport player instead of `GE_BONDVIEW_CUR`.
+- Single-player is fully verified.

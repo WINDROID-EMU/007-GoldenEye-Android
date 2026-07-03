@@ -24,7 +24,7 @@ and become instant for free.
 
 - No quick-select UI (planned as a follow-on design once switching is instant).
 - No changes to the DS weapon menu or its live-weapon-data offset work.
-- No removal of the Y-cycle path — it remains as the fallback mechanism.
+- No removal of the Y-cycle path — it remains as the cvar-off escape hatch (`ge_weapon_direct_switch=false`).
 
 ## Key facts from prior RE (do not re-litigate)
 
@@ -139,7 +139,7 @@ The Y-cycle code is kept as-is (no refactor) — the escape hatch stays boring.
 | Failure | Handling |
 |---------|----------|
 | Entry never found (Phase 1 fails) | Phase 0 + cleanups ship alone; Y-cycle remains the mechanism; update the direct-call handoff with the new trail |
-| Call lands but dirty in some player state | Phase 2 "safe to switch" gate defers; confirm-window timeout falls back to Y-cycle |
+| Call lands but dirty in some player state | Shipped: the driver re-issues the direct call every ~30 frames (the entry itself defers/drops while the player is mid-action), up to 10 tries, then gives up and clears with a log line. No automatic Y-cycle fallback; ge_weapon_direct_switch=false is the manual escape hatch. |
 | Call crashes | Must be caught in Phase 2 behind the diag harness; nothing ships enabled-by-default until the matrix is green |
 
 ## Testing (manual, per phase, desktop)

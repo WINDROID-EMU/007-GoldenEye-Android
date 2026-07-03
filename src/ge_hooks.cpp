@@ -209,7 +209,7 @@ extern "C" uint32_t rex_ge_cp_wait_reg_mem_timeouts();
 // ring is non-empty = the CP worker isn't getting scheduled (starvation).
 extern "C" uint64_t rex_ge_cp_progress_seq();
 
-// Discovery diagnostic toggle, defined in ge_gamestate.cpp:87. Declared here so
+// Discovery diagnostic toggle, defined in ge_gamestate.cpp. Declared here so
 // ge_dbg_weapon_apply (below) can gate its logging without a header dependency.
 REXCVAR_DECLARE(bool, ge_gamestate_diag);
 
@@ -1535,6 +1535,13 @@ void ge_apply_ce_data_patches(uint8_t* base);  // ge_ce_patches.cpp
 // it can share dbg_safe_ld32). See docs/HANDOFF-weapon-switch-direct-call.md.
 bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id);
 
+// Hoisted up from the BeanTools CE MP hooks section below (this file's usual
+// spot for it) because the direct-switch driver, earlier in the file, also
+// needs it -- anonymous-namespace symbols are only visible from their point of
+// declaration onward, and duplicating the constant in two anonymous
+// namespaces would make it ambiguous at the later (CE hooks) use sites.
+namespace { constexpr uint32_t GE_NET_FLAG = 0x830CAEA0u; }  // byte: !=0 = network MP session
+
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // Attach the input listener from the controller-poll path too. InitMouseLook()
   // runs at OnCreateDialogs when Runtime::display_window() can still be null, so
@@ -1573,7 +1580,13 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // the guest call can be exercised and observed in isolation. Diag-only.
   if (REXCVAR_GET(ge_gamestate_diag)) {
     const int32_t direct = ge::gamestate::TakeDirectEquip();
-    if (direct != ge::gamestate::kNoWeapon) ge_direct_equip(ctx, base, direct);
+    if (direct != ge::gamestate::kNoWeapon) {
+      if (ge::gamestate::GetWeaponSnapshot().valid) {
+        ge_direct_equip(ctx, base, direct);
+      } else {
+        REXKRNL_INFO("GEWPN equip harness: no live player snapshot, dropped");
+      }
+    }
   }
 
   // Weapon actuation: move the game to the pending target posted via
@@ -1614,7 +1627,11 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
         steps = 0; wait = 0; pressed = false;
         direct_tries = 0; direct_wait = 0;
         last_target = ge::gamestate::kNoWeapon;
-      } else if (REXCVAR_GET(ge_weapon_direct_switch)) {
+      } else if (REXCVAR_GET(ge_weapon_direct_switch) && base[GE_NET_FLAG] == 0) {
+        // Direct calls act on GE_BONDVIEW_CUR-derived state, which cycles across
+        // players in MP -- route MP sessions to the pad-injection walker below
+        // (player-0-safe by construction). Local splitscreen is NOT covered by
+        // this flag; see the handoff's known limitations.
         if (direct_wait > 0) {
           --direct_wait;  // waiting for the last issue to land
         } else if (direct_tries >= kMaxDirectTries) {
@@ -1726,7 +1743,14 @@ namespace {
 uint32_t dbg_safe_ld32(uint8_t* base, uint32_t ga) {
 #if defined(__linux__)
   static int fd = -1;
-  if (fd < 0) fd = ::open("/proc/self/mem", O_RDONLY);
+  if (fd < 0) {
+    fd = ::open("/proc/self/mem", O_RDONLY);
+    static bool warned = false;
+    if (fd < 0 && !warned) {
+      warned = true;
+      REXKRNL_WARN("GEWPN dbg_safe_ld32: /proc/self/mem open failed; guest reads degrade to sentinel (dual detection disabled)");
+    }
+  }
   uint8_t b[4] = {0};
   if (fd < 0 || pread(fd, b, 4, (off_t)((uintptr_t)base + ga)) < 4) return 0xffffffffu;
   return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
@@ -1921,7 +1945,8 @@ bool ge_ce_intro_gfx(PPCRegister& /*r3*/) { return true; }
 // functions are called directly via their generated sub_ symbols. 1:1 with
 // finalizer.c.
 // ===========================================================================
-namespace { constexpr uint32_t GE_NET_FLAG = 0x830CAEA0u; }  // byte: !=0 = network MP session
+// GE_NET_FLAG (byte @0x830CAEA0u, !=0 = network MP session) is declared above,
+// near ge_inject_keyboard, which also needs it.
 
 // disable_doors_autoclosing_on_mp @0x820E4F1C (after `lwz r11,0xE8(r30)` loads
 // the door open-tick): in a network session, force it to 0 so doors never

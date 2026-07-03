@@ -18,6 +18,9 @@
   `LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets`
 - After ANY edit to `ge_config.toml`, codegen MUST be rerun before building:
   `../GoldenEye-Recomp-rexglue/out/linux-amd64/rexglue codegen --max_jump_table_entries 2048 ge_config.toml`
+  (RECIPE STALE — discovered during execution: the working invocation is
+  `REX_MAX_JUMP_TABLE_ENTRIES=2048 .../rexglue codegen ge_manifest.toml`; see
+  docs/HANDOFF-weapon-scrollwheel-select.md.)
 - `generated/` is gitignored (game-derived). Commits include only `ge_config.toml`, `src/`, and `docs/`.
 - New cvar defaults: `ge_weapon_select_enable=true`, `ge_weapon_direct_switch=true`, keybind cvars `ge_key_wpn_next="WheelUp"`, `ge_key_wpn_prev="WheelDown"`.
 - Writing the equipped-id guest memory (`0x447f10b0` and mirrors) does NOT switch weapons and corrupts an agreement gate — confirmed dead end, do not retry.
