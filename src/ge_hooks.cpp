@@ -1536,17 +1536,31 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     static int steps = 0, wait = 0;
     static bool pressed = false;
     static int32_t equipped_at_press = 0;
+    static int32_t last_target = ge::gamestate::kNoWeapon;
     const int32_t target = ge::gamestate::PeekEquipRequest();
     if (target == ge::gamestate::kNoWeapon) {
       steps = 0; wait = 0; pressed = false;
+      last_target = ge::gamestate::kNoWeapon;
     } else {
+      if (target != last_target) {
+        // New target posted mid-cycle: restart the walk toward it.
+        steps = 0; wait = 0; pressed = false;
+        last_target = target;
+      }
       const auto snap = ge::gamestate::GetWeaponSnapshot();
-      const bool done = !snap.valid || snap.equipped_id == target;
-      const bool switching = pressed && snap.equipped_id == equipped_at_press;
-      if (done || steps >= kMaxSteps) {
+      const bool held = target >= 0 && target < ge::gamestate::kMaxWeaponSlots &&
+                        (snap.held_mask & (1u << target)) != 0;
+      if (!snap.valid || !held) {
+        // Guard: no live inventory, or a weapon the player isn't carrying --
+        // never cycle toward it; drop the request.
         ge::gamestate::ClearEquipRequest();
         steps = 0; wait = 0; pressed = false;
-      } else if (switching && wait < kStepTimeout) {
+        last_target = ge::gamestate::kNoWeapon;
+      } else if (snap.equipped_id == target || steps >= kMaxSteps) {
+        ge::gamestate::ClearEquipRequest();
+        steps = 0; wait = 0; pressed = false;
+        last_target = ge::gamestate::kNoWeapon;
+      } else if (pressed && snap.equipped_id == equipped_at_press && wait < kStepTimeout) {
         ++wait;  // previous switch still in flight; keep Y released
       } else {
         // First step, or the previous switch landed / timed out: press Y once.
