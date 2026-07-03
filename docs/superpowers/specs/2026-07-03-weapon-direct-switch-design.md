@@ -157,3 +157,23 @@ No unit harness exists for guest-memory behavior and building one is out of scop
 - Build: `cmake --build --preset linux-amd64-relwithdebinfo --target ge`
 - Run binary is `out/build/linux-amd64-relwithdebinfo/GoldenEye` (**not** `ge`):
   `LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets --ge_gamestate_diag=true`
+
+## Verification log (Phase 2 safety matrix)
+Date: 2026-07-03  Build: commits through `03e4629` (branch `feat/weapon-direct-switch`)
+Case results: 1:pass (idle, instant, draw anim correct) 2:pass (request dropped while
+firing, retried automatically, lands cleanly on release) 3:pass (mid-reload) 4:pass
+(dual grant + dual→single via the pair-call, both hands correct, no revert) 5:pass
+(same-id no-op) 6:pass (rapid two ids, last one wins, no corruption) 7:record-only
+(unheld id is granted by the raw guest entry, usually at 0 ammo — the driver's
+held-mask guard is what protects the integrated `RequestEquipWeapon` path from this).
+
+## Integrated desktop verification log (Phase 3)
+Date: 2026-07-03  Build: commits through `03e4629`
+All-pass through the real `RequestEquipWeapon` consumers (digit keys, scrollwheel,
+DS-menu path): (1) digits — instant both directions, including jumps that land on a
+dual-wield entry (accepted as intended UX); (2) scrollwheel — instant both directions
+(next/prev), required the SDK GTK discrete-scroll fix (rexglue `fix/gtk-discrete-scroll`
+@ `e84b8b7`) to arm at all; (3) fire-blocked switches land cleanly on trigger release
+via the retry loop; (4) mid-reload switch OK; (5) dual-wield dwell stable, no revert to
+unarmed; (6) `ge_weapon_direct_switch=false` — Y-cycle fallback still functional
+(confirmed unreliable-by-cycling as expected, which is why it was replaced).

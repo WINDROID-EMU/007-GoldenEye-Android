@@ -1,9 +1,16 @@
 # Follow-up: switch weapons by calling the guest function directly (RE later)
 
-**Status:** deferred optimization. The shipping feature switches weapons by
-**injecting the native Y button** (see the scrollwheel/number weapon-select
-work). This note captures the reverse-engineering done toward the *direct
-function-call* approach so a future pass can pick it up for instant jump-to-N.
+**Status: RESOLVED, DONE 2026-07-03.** The direct-call optimization this note
+was tracking has shipped. `RequestEquipWeapon` now switches instantly by
+calling the guest entry `sub_820A6F70` found below (see "Findings 2026-07").
+Shipped mechanism: `ge_direct_equip` (`src/ge_hooks.cpp`) issues the native
+pair-call `sub_820A6F70(hand0, id, 1)` + `sub_820A6F70(hand1, dual-partner-or-0,
+1)`, integrated under `RequestEquipWeapon` behind cvar `ge_weapon_direct_switch`
+(default **on**) with a 30-frame/10-try retry loop; the old Y-cycle path is kept
+behind the cvar as an escape hatch (`ge_weapon_direct_switch=false`). Verified
+end-to-end on desktop: instant digits/wheel/DS-path switching, dual-wield
+correct, fire-blocked switches land on release. Design:
+`docs/superpowers/specs/2026-07-03-weapon-direct-switch-design.md`.
 
 ## Why we deferred it
 Injecting Y (cycle-to-target) is guaranteed-correct and shipped today. The
