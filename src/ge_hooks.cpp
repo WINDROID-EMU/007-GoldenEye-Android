@@ -1137,10 +1137,14 @@ class GameInputListener final : public rex::ui::WindowInputListener,
   // same pattern rexglue's MnkInputDriver uses (mnk_wheel_pulse_frames, default
   // 2) for its own polled key table.
   void OnMouseWheel(rex::ui::MouseEvent& e) override {
+    if (REXCVAR_GET(ge_gamestate_diag))
+      REXKRNL_INFO("GEWHEEL event dy={}", e.scroll_y());
     std::lock_guard<std::mutex> l(m_);
     constexpr int kPulseFrames = 2;  // matches mnk_wheel_pulse_frames default
     if (e.scroll_y() > 0) wheel_up_frames_ = kPulseFrames;
     else if (e.scroll_y() < 0) wheel_down_frames_ = kPulseFrames;
+    if (REXCVAR_GET(ge_gamestate_diag))
+      REXKRNL_INFO("GEWHEEL armed up={} down={}", wheel_up_frames_, wheel_down_frames_);
   }
 
   // WindowListener: drop held keys / queued motion on focus loss (no stuck keys
@@ -1675,6 +1679,8 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
 
       const bool next = ge_key_down("ge_key_wpn_next");
       const bool prev = ge_key_down("ge_key_wpn_prev");
+      if ((next || prev) && REXCVAR_GET(ge_gamestate_diag))
+        REXKRNL_INFO("GEWHEEL keydown next={} prev={}", next, prev);
       if ((next && !prev_next) || (prev && !prev_prev)) {
         int idx = 0;
         for (int i = 0; i < snap.held_count; ++i)
