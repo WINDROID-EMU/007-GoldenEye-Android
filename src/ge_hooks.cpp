@@ -1615,14 +1615,14 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
         direct_tries = 0; direct_wait = 0;
         last_target = ge::gamestate::kNoWeapon;
       } else if (REXCVAR_GET(ge_weapon_direct_switch)) {
-        if (direct_tries >= kMaxDirectTries) {
+        if (direct_wait > 0) {
+          --direct_wait;  // waiting for the last issue to land
+        } else if (direct_tries >= kMaxDirectTries) {
           REXKRNL_INFO("GEWPN direct switch gave up after {} tries (target={})",
                        direct_tries, target);
           ge::gamestate::ClearEquipRequest();
           direct_tries = 0; direct_wait = 0;
           last_target = ge::gamestate::kNoWeapon;
-        } else if (direct_wait > 0) {
-          --direct_wait;  // waiting for the last issue to land
         } else {
           ge_direct_equip(ctx, base, target);  // dedups guest-side; re-issue is safe
           ++direct_tries; direct_wait = kDirectConfirm;
