@@ -1521,6 +1521,8 @@ REXCVAR_DEFINE_STRING(ge_key_start, "Return", "Input/Keybinds", "Start button");
 REXCVAR_DEFINE_STRING(ge_key_back, "Tab", "Input/Keybinds", "Back button");
 REXCVAR_DEFINE_BOOL(ge_weapon_select_enable, true, "Input",
                     "Number keys 1-9 / scrollwheel select carried weapons");
+REXCVAR_DEFINE_BOOL(ge_weapon_direct_switch, true, "Input",
+                    "Switch weapons via a direct game call (off = Y-cycle walk)");
 REXCVAR_DEFINE_STRING(ge_key_wpn_next, "WheelUp", "Input/Keybinds", "Next carried weapon");
 REXCVAR_DEFINE_STRING(ge_key_wpn_prev, "WheelDown", "Input/Keybinds", "Previous carried weapon");
 
@@ -1574,47 +1576,65 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     if (direct != ge::gamestate::kNoWeapon) ge_direct_equip(ctx, base, direct);
   }
 
-  // Weapon actuation: step the game's native Y (weapon-switch) input toward the
-  // pending target posted via RequestEquipWeapon. Each Y press starts a switch
-  // that takes several frames; the equipped id only updates once it completes. So
-  // we must pulse Y once, then WAIT for the switch to land (equipped id changes)
-  // before pressing again -- otherwise the presses queue and cycle straight past
-  // the target (symptom: it lowers the gun and comes back to the same weapon).
-  // Caps bound it if a switch never lands or the target is unreachable.
+  // Weapon actuation: move the game to the pending target posted via
+  // RequestEquipWeapon. Preferred mechanism: direct calls into the game's own
+  // switch routine (instant; see ge_direct_equip -- both hands, dual-aware).
+  // The entry silently drops requests while the player is mid-action (e.g.
+  // firing), so the driver re-issues every kDirectConfirm frames until the
+  // switch lands or kMaxDirectTries expire. The pre-discovery Y-cycle walker
+  // is kept intact behind ge_weapon_direct_switch=false as the escape hatch.
   {
-    constexpr int kMaxSteps = 16;     // total Y presses before giving up
-    constexpr int kStepTimeout = 90;  // frames to wait for one switch to land
+    constexpr int kMaxSteps = 16;       // Y-cycle: total presses before giving up
+    constexpr int kStepTimeout = 90;    // Y-cycle: frames for one switch to land
+    constexpr int kDirectConfirm = 30;  // direct: frames between (re)issues
+    constexpr int kMaxDirectTries = 10; // direct: re-issues before giving up
     static int steps = 0, wait = 0;
     static bool pressed = false;
     static int32_t equipped_at_press = 0;
     static int32_t last_target = ge::gamestate::kNoWeapon;
+    static int direct_tries = 0, direct_wait = 0;
     const int32_t target = ge::gamestate::PeekEquipRequest();
     if (target == ge::gamestate::kNoWeapon) {
       steps = 0; wait = 0; pressed = false;
+      direct_tries = 0; direct_wait = 0;
       last_target = ge::gamestate::kNoWeapon;
     } else {
       if (target != last_target) {
-        // New target posted mid-cycle: restart the walk toward it.
+        // New target posted mid-flight: restart both mechanisms toward it.
         steps = 0; wait = 0; pressed = false;
+        direct_tries = 0; direct_wait = 0;
         last_target = target;
       }
       const auto snap = ge::gamestate::GetWeaponSnapshot();
       const bool held = target >= 0 && target < ge::gamestate::kMaxWeaponSlots &&
                         (snap.held_mask & (1u << target)) != 0;
-      if (!snap.valid || !held) {
-        // Guard: no live inventory, or a weapon the player isn't carrying --
-        // never cycle toward it; drop the request.
+      if (!snap.valid || !held || snap.equipped_id == target) {
+        // Done, or guarded out (no live inventory / unheld id) -- drop the request.
         ge::gamestate::ClearEquipRequest();
         steps = 0; wait = 0; pressed = false;
+        direct_tries = 0; direct_wait = 0;
         last_target = ge::gamestate::kNoWeapon;
-      } else if (snap.equipped_id == target || steps >= kMaxSteps) {
+      } else if (REXCVAR_GET(ge_weapon_direct_switch)) {
+        if (direct_tries >= kMaxDirectTries) {
+          REXKRNL_INFO("GEWPN direct switch gave up after {} tries (target={})",
+                       direct_tries, target);
+          ge::gamestate::ClearEquipRequest();
+          direct_tries = 0; direct_wait = 0;
+          last_target = ge::gamestate::kNoWeapon;
+        } else if (direct_wait > 0) {
+          --direct_wait;  // waiting for the last issue to land
+        } else {
+          ge_direct_equip(ctx, base, target);  // dedups guest-side; re-issue is safe
+          ++direct_tries; direct_wait = kDirectConfirm;
+        }
+      } else if (steps >= kMaxSteps) {
         ge::gamestate::ClearEquipRequest();
         steps = 0; wait = 0; pressed = false;
         last_target = ge::gamestate::kNoWeapon;
       } else if (pressed && snap.equipped_id == equipped_at_press && wait < kStepTimeout) {
-        ++wait;  // previous switch still in flight; keep Y released
+        ++wait;  // Y-cycle: previous switch still in flight
       } else {
-        // First step, or the previous switch landed / timed out: press Y once.
+        // Y-cycle: first press, or the previous switch landed / timed out.
         ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | BTN_Y);
         equipped_at_press = snap.equipped_id;
         pressed = true; ++steps; wait = 0;
