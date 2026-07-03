@@ -1651,6 +1651,28 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   }
 }
 
+namespace {
+// Fault-safe guest read for the diag hook below. The recomp's guard/unmapped
+// pages make a raw LD32 of a stray guest pointer retry its SIGSEGV forever
+// (total freeze -- hit live when the applier was called with a garbage r4
+// during level load). pread on /proc/self/mem fails gracefully instead; same
+// pattern as memscan::rd() in ge_gamestate.cpp. Returns 0xffffffff sentinel
+// when unreadable.
+uint32_t dbg_safe_ld32(uint8_t* base, uint32_t ga) {
+#if defined(__linux__)
+  static int fd = -1;
+  if (fd < 0) fd = ::open("/proc/self/mem", O_RDONLY);
+  uint8_t b[4] = {0};
+  if (fd < 0 || pread(fd, b, 4, (off_t)((uintptr_t)base + ga)) < 4) return 0xffffffffu;
+  return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+         ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+#else
+  (void)base; (void)ga;
+  return 0xffffffffu;
+#endif
+}
+}  // namespace
+
 // ===========================================================================
 // Phase-1 discovery hook (weapon direct-switch RE; spec:
 // docs/superpowers/specs/2026-07-03-weapon-direct-switch-design.md). Entry of
@@ -1665,13 +1687,15 @@ void ge_dbg_weapon_apply(PPCRegister& r3, PPCRegister& r4) {
   PPCContext* ctx; uint8_t* base; getcb(ctx, base);
   const uint32_t obj = r4.u32;
   uint32_t w[4] = {0, 0, 0, 0};
-  if (obj) for (int i = 0; i < 4; ++i) w[i] = LD32(base, obj + 4u * i);
-  // 0x447f10b0 = equipped-id block (kEquipIdAddr in ge_gamestate.cpp); only
-  // read here, inside the applier, when it is guaranteed live.
+  if (obj) for (int i = 0; i < 4; ++i) w[i] = dbg_safe_ld32(base, obj + 4u * i);
+  // 0x447f10b0 = equipped-id block (kEquipIdAddr in ge_gamestate.cpp); reads
+  // are fault-safe (dbg_safe_ld32) -- the applier can be called with a
+  // garbage r4 during level load, so "guaranteed live" was a false assumption
+  // that caused a total freeze (raw LD32 retrying a SIGSEGV forever).
   REXKRNL_INFO("GEWPNAPPLY lr={:#010x} hand={} obj={:#010x} "
                "obj[0..3]={:#010x},{:#010x},{:#010x},{:#010x} equip={}",
                (uint32_t)ctx->lr, r3.u32, obj, w[0], w[1], w[2], w[3],
-               (int32_t)LD32(base, 0x447f10b0u));
+               (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
 }
 
 // ===========================================================================
