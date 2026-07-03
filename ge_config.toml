@@ -122,6 +122,13 @@ address = 0x823B25E4
 name = "ge_inject_keyboard"
 registers = ["r11"]
 after_instruction = true
+# Phase-1 discovery (weapon direct-switch RE): entry of sub_820A7508, the
+# per-hand weapon applier. Logs caller lr + args; diag-gated in ge_hooks.cpp.
+[[midasm_hook]]
+address = 0x820A7508
+name = "ge_dbg_weapon_apply"
+registers = ["r3", "r4"]
+after_instruction = false
 # NOTE: upstream's ge_debug_gate (hidden debug-menu enable @0x82189F2C) is NOT
 # pulled in -- its implementation lives in an earlier upstream commit that isn't on
 # this branch, and it is not part of the CE patch set.

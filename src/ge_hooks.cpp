@@ -209,6 +209,10 @@ extern "C" uint32_t rex_ge_cp_wait_reg_mem_timeouts();
 // ring is non-empty = the CP worker isn't getting scheduled (starvation).
 extern "C" uint64_t rex_ge_cp_progress_seq();
 
+// Discovery diagnostic toggle, defined in ge_gamestate.cpp. Declared here so
+// ge_dbg_weapon_apply (below) can gate its logging without a header dependency.
+REXCVAR_DECLARE(bool, ge_gamestate_diag);
+
 // CP-starvation episodes observed by the watchdog (ring non-empty but the CP
 // progress seq did not advance across a 250ms watchdog tick). Coarse by design
 // -- fine-grained starvation shows up as missing time in the per-frame CP
@@ -1058,6 +1062,17 @@ class GameInputListener final : public rex::ui::WindowInputListener,
     return key_down_[idx];
   }
 
+  // Decay the wheel pulse armed by OnMouseWheel into key_down_, once per game
+  // frame (called from ge_inject_keyboard, not from key_down() itself, which is
+  // polled multiple times per frame and would double-decrement the pulse).
+  void tick_wheel() {
+    std::lock_guard<std::mutex> l(m_);
+    key_down_[static_cast<uint16_t>(rex::ui::VirtualKey::kMouseWheelUp)] = wheel_up_frames_ > 0;
+    key_down_[static_cast<uint16_t>(rex::ui::VirtualKey::kMouseWheelDown)] = wheel_down_frames_ > 0;
+    if (wheel_up_frames_ > 0) --wheel_up_frames_;
+    if (wheel_down_frames_ > 0) --wheel_down_frames_;
+  }
+
   bool focused() const { return window_ && window_->HasFocus(); }
   bool suppressed() const { return suppressed_.load(std::memory_order_relaxed); }
 
@@ -1116,6 +1131,21 @@ class GameInputListener final : public rex::ui::WindowInputListener,
   void OnMouseUp(rex::ui::MouseEvent& e) override { set_mouse_button(e.button(), false); }
   void OnKeyDown(rex::ui::KeyEvent& e) override { set_key(e.virtual_key(), true); }
   void OnKeyUp(rex::ui::KeyEvent& e) override { set_key(e.virtual_key(), false); }
+  // Wheel notches are edge-only (one callback per detent, no held state at the
+  // window layer -- see rex::ui::WindowInputListener::OnMouseWheel). Arm a short
+  // pulse here; tick_wheel() decays it into key_down_ once per game frame, the
+  // same pattern rexglue's MnkInputDriver uses (mnk_wheel_pulse_frames, default
+  // 2) for its own polled key table.
+  void OnMouseWheel(rex::ui::MouseEvent& e) override {
+    if (REXCVAR_GET(ge_gamestate_diag))
+      REXKRNL_INFO("GEWHEEL event dy={}", e.scroll_y());
+    std::lock_guard<std::mutex> l(m_);
+    constexpr int kPulseFrames = 2;  // matches mnk_wheel_pulse_frames default
+    if (e.scroll_y() > 0) wheel_up_frames_ = kPulseFrames;
+    else if (e.scroll_y() < 0) wheel_down_frames_ = kPulseFrames;
+    if (REXCVAR_GET(ge_gamestate_diag))
+      REXKRNL_INFO("GEWHEEL armed up={} down={}", wheel_up_frames_, wheel_down_frames_);
+  }
 
   // WindowListener: drop held keys / queued motion on focus loss (no stuck keys
   // or view snap on alt-tab). Capture itself auto-releases via tick_capture.
@@ -1123,6 +1153,7 @@ class GameInputListener final : public rex::ui::WindowInputListener,
     std::lock_guard<std::mutex> l(m_);
     std::memset(key_down_, 0, sizeof(key_down_));
     dx_ = 0.f; dy_ = 0.f; have_prev_ = false; raw_motion_ = false;
+    wheel_up_frames_ = 0; wheel_down_frames_ = 0;
   }
 
  private:
@@ -1156,6 +1187,7 @@ class GameInputListener final : public rex::ui::WindowInputListener,
   bool captured_ = false;
   std::atomic<bool> suppressed_{false};  // true while the pause menu is open
   bool key_down_[256] = {};
+  int wheel_up_frames_ = 0, wheel_down_frames_ = 0;  // armed by OnMouseWheel, decayed by tick_wheel()
 };
 
 GameInputListener g_listener;
@@ -1487,12 +1519,28 @@ REXCVAR_DEFINE_STRING(ge_key_dleft, "Left", "Input/Keybinds", "D-pad left");
 REXCVAR_DEFINE_STRING(ge_key_dright, "Right", "Input/Keybinds", "D-pad right");
 REXCVAR_DEFINE_STRING(ge_key_start, "Return", "Input/Keybinds", "Start button");
 REXCVAR_DEFINE_STRING(ge_key_back, "Tab", "Input/Keybinds", "Back button");
+REXCVAR_DEFINE_BOOL(ge_weapon_select_enable, true, "Input",
+                    "Number keys 1-9 / scrollwheel select carried weapons");
+REXCVAR_DEFINE_BOOL(ge_weapon_direct_switch, true, "Input",
+                    "Switch weapons via a direct game call (off = Y-cycle walk)");
+REXCVAR_DEFINE_STRING(ge_key_wpn_next, "WheelUp", "Input/Keybinds", "Next carried weapon");
+REXCVAR_DEFINE_STRING(ge_key_wpn_prev, "WheelDown", "Input/Keybinds", "Previous carried weapon");
 
 // Runs once per controller poll, after XamInputGetState fills the slot-0 buffer
 // and before the guest dispatches it. OR our keyboard buttons in, and set the
 // left stick / triggers when their keys are held (pad input is preserved).
 void ge_mouse_camera(uint8_t* base);  // defined above
 void ge_apply_ce_data_patches(uint8_t* base);  // ge_ce_patches.cpp
+// Phase-2 verification harness (defined below, next to the discovery hook, so
+// it can share dbg_safe_ld32). See docs/HANDOFF-weapon-switch-direct-call.md.
+bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id);
+
+// Hoisted up from the BeanTools CE MP hooks section below (this file's usual
+// spot for it) because the direct-switch driver, earlier in the file, also
+// needs it -- anonymous-namespace symbols are only visible from their point of
+// declaration onward, and duplicating the constant in two anonymous
+// namespaces would make it ambiguous at the later (CE hooks) use sites.
+namespace { constexpr uint32_t GE_NET_FLAG = 0x830CAEA0u; }  // byte: !=0 = network MP session
 
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // Attach the input listener from the controller-poll path too. InitMouseLook()
@@ -1502,7 +1550,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // it attaches early. NB: the keyboard early-return moved BELOW the CE/mouse
   // block so data fixes + mouse-look still run when only the keyboard is off.
   ge_ensure_listener();
-  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
 
   // Apply BeanTools community DATA bug-fixes once, before any level loads its
   // setup/fog/BG data. The data segment is live in guest RAM by the first input
@@ -1521,35 +1569,89 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // live in the now-removed ge_mouselook_pitch hook; ge_ensure_listener already
   // ran at the top of this function).
   g_listener.tick_capture();
+  // Decay any wheel pulse armed by OnMouseWheel into key_down_ this frame (see
+  // GameInputListener::tick_wheel()) -- must run once per frame, same cadence
+  // the weapon-select block below polls kMouseWheelUp/Down at.
+  g_listener.tick_wheel();
   if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
 
-  // Weapon actuation: step the game's native Y (weapon-switch) input toward the
-  // pending target posted via RequestEquipWeapon. Each Y press starts a switch
-  // that takes several frames; the equipped id only updates once it completes. So
-  // we must pulse Y once, then WAIT for the switch to land (equipped id changes)
-  // before pressing again -- otherwise the presses queue and cycle straight past
-  // the target (symptom: it lowers the gun and comes back to the same weapon).
-  // Caps bound it if a switch never lands or the target is unreachable.
+  // Phase-2 verification harness: an `equip <id>` posted from the memscan
+  // command channel fires ONE direct switch, bypassing RequestEquipWeapon, so
+  // the guest call can be exercised and observed in isolation. Diag-only.
+  if (REXCVAR_GET(ge_gamestate_diag)) {
+    const int32_t direct = ge::gamestate::TakeDirectEquip();
+    if (direct != ge::gamestate::kNoWeapon) {
+      if (ge::gamestate::GetWeaponSnapshot().valid) {
+        ge_direct_equip(ctx, base, direct);
+      } else {
+        REXKRNL_INFO("GEWPN equip harness: no live player snapshot, dropped");
+      }
+    }
+  }
+
+  // Weapon actuation: move the game to the pending target posted via
+  // RequestEquipWeapon. Preferred mechanism: direct calls into the game's own
+  // switch routine (instant; see ge_direct_equip -- both hands, dual-aware).
+  // The entry silently drops requests while the player is mid-action (e.g.
+  // firing), so the driver re-issues every kDirectConfirm frames until the
+  // switch lands or kMaxDirectTries expire. The pre-discovery Y-cycle walker
+  // is kept intact behind ge_weapon_direct_switch=false as the escape hatch.
   {
-    constexpr int kMaxSteps = 16;     // total Y presses before giving up
-    constexpr int kStepTimeout = 90;  // frames to wait for one switch to land
+    constexpr int kMaxSteps = 16;       // Y-cycle: total presses before giving up
+    constexpr int kStepTimeout = 90;    // Y-cycle: frames for one switch to land
+    constexpr int kDirectConfirm = 30;  // direct: frames between (re)issues
+    constexpr int kMaxDirectTries = 10; // direct: re-issues before giving up
     static int steps = 0, wait = 0;
     static bool pressed = false;
     static int32_t equipped_at_press = 0;
+    static int32_t last_target = ge::gamestate::kNoWeapon;
+    static int direct_tries = 0, direct_wait = 0;
     const int32_t target = ge::gamestate::PeekEquipRequest();
     if (target == ge::gamestate::kNoWeapon) {
       steps = 0; wait = 0; pressed = false;
+      direct_tries = 0; direct_wait = 0;
+      last_target = ge::gamestate::kNoWeapon;
     } else {
+      if (target != last_target) {
+        // New target posted mid-flight: restart both mechanisms toward it.
+        steps = 0; wait = 0; pressed = false;
+        direct_tries = 0; direct_wait = 0;
+        last_target = target;
+      }
       const auto snap = ge::gamestate::GetWeaponSnapshot();
-      const bool done = !snap.valid || snap.equipped_id == target;
-      const bool switching = pressed && snap.equipped_id == equipped_at_press;
-      if (done || steps >= kMaxSteps) {
+      const bool held = target >= 0 && target < ge::gamestate::kMaxWeaponSlots &&
+                        (snap.held_mask & (1u << target)) != 0;
+      if (!snap.valid || !held || snap.equipped_id == target) {
+        // Done, or guarded out (no live inventory / unheld id) -- drop the request.
         ge::gamestate::ClearEquipRequest();
         steps = 0; wait = 0; pressed = false;
-      } else if (switching && wait < kStepTimeout) {
-        ++wait;  // previous switch still in flight; keep Y released
+        direct_tries = 0; direct_wait = 0;
+        last_target = ge::gamestate::kNoWeapon;
+      } else if (REXCVAR_GET(ge_weapon_direct_switch) && base[GE_NET_FLAG] == 0) {
+        // Direct calls act on GE_BONDVIEW_CUR-derived state, which cycles across
+        // players in MP -- route MP sessions to the pad-injection walker below
+        // (player-0-safe by construction). Local splitscreen is NOT covered by
+        // this flag; see the handoff's known limitations.
+        if (direct_wait > 0) {
+          --direct_wait;  // waiting for the last issue to land
+        } else if (direct_tries >= kMaxDirectTries) {
+          REXKRNL_INFO("GEWPN direct switch gave up after {} tries (target={})",
+                       direct_tries, target);
+          ge::gamestate::ClearEquipRequest();
+          direct_tries = 0; direct_wait = 0;
+          last_target = ge::gamestate::kNoWeapon;
+        } else {
+          ge_direct_equip(ctx, base, target);  // dedups guest-side; re-issue is safe
+          ++direct_tries; direct_wait = kDirectConfirm;
+        }
+      } else if (steps >= kMaxSteps) {
+        ge::gamestate::ClearEquipRequest();
+        steps = 0; wait = 0; pressed = false;
+        last_target = ge::gamestate::kNoWeapon;
+      } else if (pressed && snap.equipped_id == equipped_at_press && wait < kStepTimeout) {
+        ++wait;  // Y-cycle: previous switch still in flight
       } else {
-        // First step, or the previous switch landed / timed out: press Y once.
+        // Y-cycle: first press, or the previous switch landed / timed out.
         ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | BTN_Y);
         equipped_at_press = snap.equipped_id;
         pressed = true; ++steps; wait = 0;
@@ -1587,26 +1689,206 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   if (lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(lx));
   if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
 
-  // TEMP (Task 1 verification, removed in Task 2): press N to request the next
-  // carried weapon; the driver above cycles Y to reach it. Disabled for the
-  // prerelease (the real scrollwheel/number input driver lands in Task 2); the
-  // second-screen weapon menu already drives switching via RequestEquipWeapon.
-#if 0
-  {
-    static bool prev_n = false;
-    const bool n = g_listener.key_down(rex::ui::VirtualKey::kN);
-    if (n && !prev_n) {
-      const auto snap = ge::gamestate::GetWeaponSnapshot();
-      if (snap.valid && snap.held_count > 0) {
+  // Weapon selection: digits 1-9 jump straight to the Nth carried weapon, and
+  // the scrollwheel steps next/prev through the carried list. Edge-triggered so
+  // a held key posts exactly one request. Actuation happens in the driver
+  // above (which walks or direct-calls the game to the target), so this block
+  // only ever posts RequestEquipWeapon.
+  if (REXCVAR_GET(ge_weapon_select_enable)) {
+    static rex::ui::VirtualKey digit_vk[9] = {};
+    static bool vk_init = false;
+    if (!vk_init) {
+      vk_init = true;
+      const char* names[9] = {"1", "2", "3", "4", "5", "6", "7", "8", "9"};
+      for (int i = 0; i < 9; ++i) digit_vk[i] = rex::ui::ParseVirtualKey(names[i]);
+    }
+    static uint16_t prev_digits = 0;
+    static bool prev_next = false, prev_prev = false;
+    const auto snap = ge::gamestate::GetWeaponSnapshot();
+    if (snap.valid && snap.held_count > 0) {
+      uint16_t digits = 0;
+      for (int i = 0; i < 9; ++i)
+        if (g_listener.key_down(digit_vk[i])) digits |= (uint16_t)(1u << i);
+      for (int i = 0; i < 9 && i < snap.held_count; ++i)
+        if ((digits & (1u << i)) && !(prev_digits & (1u << i)))
+          ge::gamestate::RequestEquipWeapon(snap.held_ids[i]);
+      prev_digits = digits;
+
+      const bool next = ge_key_down("ge_key_wpn_next");
+      const bool prev = ge_key_down("ge_key_wpn_prev");
+      if ((next || prev) && REXCVAR_GET(ge_gamestate_diag))
+        REXKRNL_INFO("GEWHEEL keydown next={} prev={}", next, prev);
+      if ((next && !prev_next) || (prev && !prev_prev)) {
         int idx = 0;
         for (int i = 0; i < snap.held_count; ++i)
           if (snap.held_ids[i] == snap.equipped_id) { idx = i; break; }
-        ge::gamestate::RequestEquipWeapon(snap.held_ids[(idx + 1) % snap.held_count]);
+        const int step = (next && !prev_next) ? 1 : -1;
+        const int n = (idx + step + snap.held_count) % snap.held_count;
+        ge::gamestate::RequestEquipWeapon(snap.held_ids[n]);
       }
+      prev_next = next; prev_prev = prev;
+    } else {
+      prev_digits = 0; prev_next = false; prev_prev = false;
     }
-    prev_n = n;
   }
+}
+
+namespace {
+// Fault-safe guest read for the diag hook below. The recomp's guard/unmapped
+// pages make a raw LD32 of a stray guest pointer retry its SIGSEGV forever
+// (total freeze -- hit live when the applier was called with a garbage r4
+// during level load). pread on /proc/self/mem fails gracefully instead; same
+// pattern as memscan::rd() in ge_gamestate.cpp. Returns 0xffffffff sentinel
+// when unreadable.
+uint32_t dbg_safe_ld32(uint8_t* base, uint32_t ga) {
+#if defined(__linux__)
+  static int fd = -1;
+  if (fd < 0) {
+    fd = ::open("/proc/self/mem", O_RDONLY);
+    static bool warned = false;
+    if (fd < 0 && !warned) {
+      warned = true;
+      REXKRNL_WARN("GEWPN dbg_safe_ld32: /proc/self/mem open failed; guest reads degrade to sentinel (dual detection disabled)");
+    }
+  }
+  uint8_t b[4] = {0};
+  if (fd < 0 || pread(fd, b, 4, (off_t)((uintptr_t)base + ga)) < 4) return 0xffffffffu;
+  return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+         ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+#else
+  (void)base; (void)ga;
+  return 0xffffffffu;
 #endif
+}
+
+// Dual-item inventory walk (task-3-analysis-round2.md "Host recipe" / Q1 & Q4):
+// `g = load_be32(GE_BONDVIEW_CUR)` (0x82F1FAAC, the player-hands struct
+// pointer already used elsewhere in this file) heads a circular linked list
+// of carried-item records at `*(g+4744)`. Each node is
+// `{u32 type @+0, u32 idA @+4, u32 idB @+8, u32 next @+12}`; `type==3` is a
+// dual-item record `{3, idA, idB}` (a same-weapon dual, e.g. dual Phantoms,
+// is `{3, 0x0c, 0x0c}`). Returns true and writes the *other* id in the node
+// through `partner_out` iff a dual record containing `weapon_id` is found.
+//
+// Every read goes through dbg_safe_ld32 (fault-safe: returns the 0xffffffff
+// sentinel instead of retrying a SIGSEGV forever) and every pointer is
+// bounds-checked before it is dereferenced, mirroring
+// ge_gamestate.cpp's plausible_guest_ptr idiom -- any sentinel/implausible
+// read anywhere in the walk aborts it and reports "not dual" rather than
+// risk a fault loop. kMaxDualWalk bounds the node count as a second guard
+// against a corrupt/cyclic list that never re-hits `head`.
+constexpr int kMaxDualWalk = 64;
+inline bool ge_plausible_guest_ptr(uint32_t ga) {
+  return ga >= 0x00010000u && ga < 0xFFFF0000u;
+}
+bool ge_find_dual_partner(uint8_t* base, int32_t weapon_id, int32_t* partner_out) {
+  const uint32_t g = dbg_safe_ld32(base, GE_BONDVIEW_CUR);
+  if (g == 0xffffffffu || !ge_plausible_guest_ptr(g)) return false;
+  const uint32_t head = dbg_safe_ld32(base, g + 4744u);
+  if (head == 0xffffffffu || head == 0u || !ge_plausible_guest_ptr(head)) return false;
+  uint32_t node = head;
+  for (int i = 0; i < kMaxDualWalk; ++i) {
+    const uint32_t type = dbg_safe_ld32(base, node + 0u);
+    const uint32_t idA  = dbg_safe_ld32(base, node + 4u);
+    const uint32_t idB  = dbg_safe_ld32(base, node + 8u);
+    const uint32_t next = dbg_safe_ld32(base, node + 12u);
+    if (type == 0xffffffffu || idA == 0xffffffffu || idB == 0xffffffffu ||
+        next == 0xffffffffu) {
+      return false;  // fault mid-walk -- never trust a torn read
+    }
+    if (type == 3u && (static_cast<int32_t>(idA) == weapon_id ||
+                        static_cast<int32_t>(idB) == weapon_id)) {
+      *partner_out = static_cast<int32_t>(
+          static_cast<int32_t>(idA) == weapon_id ? idB : idA);
+      return true;
+    }
+    if (next == 0u || next == head) break;       // list end / one full loop
+    if (!ge_plausible_guest_ptr(next)) break;     // implausible next -- stop
+    node = next;
+  }
+  return false;
+}
+}  // namespace
+
+// ===========================================================================
+// Phase-1 discovery hook (weapon direct-switch RE; spec:
+// docs/superpowers/specs/2026-07-03-weapon-direct-switch-design.md). Entry of
+// sub_820A7508, the per-hand weapon applier -- the known bottom of the switch
+// call chain. Logs the guest caller (lr) and args so a pause-menu inventory
+// selection can be diffed against a Y-cycle switch: the first lr unique to
+// the pause-menu path identifies the direct-switch caller. Inert unless
+// ge_gamestate_diag is set (desktop RE sessions only).
+// ===========================================================================
+void ge_dbg_weapon_apply(PPCRegister& r3, PPCRegister& r4) {
+  if (!REXCVAR_GET(ge_gamestate_diag)) return;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  const uint32_t obj = r4.u32;
+  uint32_t w[4] = {0, 0, 0, 0};
+  if (obj) for (int i = 0; i < 4; ++i) w[i] = dbg_safe_ld32(base, obj + 4u * i);
+  // 0x447f10b0 = equipped-id block (kEquipIdAddr in ge_gamestate.cpp); reads
+  // are fault-safe (dbg_safe_ld32) -- the applier can be called with a
+  // garbage r4 during level load, so "guaranteed live" was a false assumption
+  // that caused a total freeze (raw LD32 retrying a SIGSEGV forever).
+  REXKRNL_INFO("GEWPNAPPLY lr={:#010x} hand={} obj={:#010x} "
+               "obj[0..3]={:#010x},{:#010x},{:#010x},{:#010x} equip={}",
+               (uint32_t)ctx->lr, r3.u32, obj, w[0], w[1], w[2], w[3],
+               (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
+}
+
+// ===========================================================================
+// Phase-2 verification harness: direct weapon switch -- the verified
+// two-hand pair-call recipe (task-3-analysis-round2.md "Host recipe"). The
+// native Y-cycle helpers never issue a lone hand-0 or hand-1 request; they
+// always request BOTH hands together in the same quantum (sub_820A6F70(0,...)
+// immediately followed by sub_820A6F70(1,...)), which is what arms hand 1's
+// state-5 bypass before hand 0's own swap point can force-clobber it (round-2
+// Q1's "ordering/clobber caveat"). This function reproduces that pairing:
+//   - Single switch: hand 0 <- weapon_id, hand 1 <- 0 (id 0 is an explicit
+//     off-hand clear -- sub_820C0D48's "b==0" rule always passes it), so a
+//     single-weapon switch also clears any stale off-hand weapon.
+//   - Dual grant: if the inventory's dual-item list (walked fault-safe by
+//     ge_find_dual_partner) has a {3, idA, idB} record containing weapon_id,
+//     hand 1 <- the other id in that record (usually == weapon_id), granting
+//     both hands the dual weapon; otherwise hand 1 still gets the explicit
+//     clear above.
+// Always issues the pair and returns true -- the pair-call has no failure
+// mode of its own (sub_820A6F70 has no validation, see round-2 Q2). The bool
+// return is kept for a future compile-out safety switch, not because this
+// can fail today.
+//
+// MUST run on a guest thread inside a midasm hook. The full-context
+// save/restore is required: we are mid-way through ge_inject_keyboard's host
+// hook, and the generated caller resumes from ctx after we return -- a guest
+// call here clobbers volatile registers/lr otherwise. One save covers both
+// calls; there must be no return between them (same-quantum requirement).
+// ===========================================================================
+bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id) {
+  const int32_t before = (int32_t)dbg_safe_ld32(base, 0x447f10b0u);  // equipped-id block
+
+  int32_t partner = 0;
+  const bool dual = ge_find_dual_partner(base, weapon_id, &partner);
+  const int32_t off_hand_id = dual ? partner : 0;
+
+  const PPCContext saved = *ctx;
+
+  // sub_820A6F70(hand, weapon id, direction/mode) -- the sole funnel for the
+  // native Y-cycle input paths (Findings 2026-07). Both calls land in this
+  // one hook invocation, back-to-back, so hand 1's requested-state is armed
+  // before hand 0's swap point runs.
+  ctx->r3.u32 = 0u;                        // hand 0 = main hand
+  ctx->r4.u32 = (uint32_t)weapon_id;       // raw weapon id (verified: applier takes ids)
+  ctx->r5.u32 = 1u;                        // direction/mode; constant 1 on all native paths
+  sub_820A6F70(*ctx, base);
+
+  ctx->r3.u32 = 1u;                        // hand 1 = off hand
+  ctx->r4.u32 = (uint32_t)off_hand_id;     // dual partner id, or 0 = explicit clear
+  ctx->r5.u32 = 1u;
+  sub_820A6F70(*ctx, base);
+
+  *ctx = saved;
+  REXKRNL_INFO("GEWPN direct equip id={} dual={} equip_before={} equip_after={}",
+               weapon_id, dual, before, (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
+  return true;
 }
 
 // ===========================================================================
@@ -1663,7 +1945,8 @@ bool ge_ce_intro_gfx(PPCRegister& /*r3*/) { return true; }
 // functions are called directly via their generated sub_ symbols. 1:1 with
 // finalizer.c.
 // ===========================================================================
-namespace { constexpr uint32_t GE_NET_FLAG = 0x830CAEA0u; }  // byte: !=0 = network MP session
+// GE_NET_FLAG (byte @0x830CAEA0u, !=0 = network MP session) is declared above,
+// near ge_inject_keyboard, which also needs it.
 
 // disable_doors_autoclosing_on_mp @0x820E4F1C (after `lwz r11,0xE8(r30)` loads
 // the door open-tick): in a network session, force it to 0 so doors never

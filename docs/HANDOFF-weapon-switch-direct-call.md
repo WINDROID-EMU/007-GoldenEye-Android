@@ -1,9 +1,16 @@
 # Follow-up: switch weapons by calling the guest function directly (RE later)
 
-**Status:** deferred optimization. The shipping feature switches weapons by
-**injecting the native Y button** (see the scrollwheel/number weapon-select
-work). This note captures the reverse-engineering done toward the *direct
-function-call* approach so a future pass can pick it up for instant jump-to-N.
+**Status: RESOLVED, DONE 2026-07-03.** The direct-call optimization this note
+was tracking has shipped. `RequestEquipWeapon` now switches instantly by
+calling the guest entry `sub_820A6F70` found below (see "Findings 2026-07").
+Shipped mechanism: `ge_direct_equip` (`src/ge_hooks.cpp`) issues the native
+pair-call `sub_820A6F70(hand0, id, 1)` + `sub_820A6F70(hand1, dual-partner-or-0,
+1)`, integrated under `RequestEquipWeapon` behind cvar `ge_weapon_direct_switch`
+(default **on**) with a 30-frame/10-try retry loop; the old Y-cycle path is kept
+behind the cvar as an escape hatch (`ge_weapon_direct_switch=false`). Verified
+end-to-end on desktop: instant digits/wheel/DS-path switching, dual-wield
+correct, fire-blocked switches land on release. Design:
+`docs/superpowers/specs/2026-07-03-weapon-direct-switch-design.md`.
 
 ## Why we deferred it
 Injecting Y (cycle-to-target) is guaranteed-correct and shipped today. The
@@ -46,3 +53,39 @@ The recompiled code keeps original PPC asm as comments — grep those.
 The desktop binary is **`out/build/linux-amd64-relwithdebinfo/GoldenEye`**
 (CMake `OUTPUT_NAME "GoldenEye"`), NOT `ge`. `CLAUDE.md`'s run recipe says `ge`
 and is wrong.
+
+## Findings 2026-07 (runtime trace + static walk-up) — ENTRY IDENTIFIED
+- **Correction to the trail above:** `sub_820A7508`'s `r4` is the **raw weapon id**, NOT a
+  resolved object (verified live: obj=0x01/0x05/0x11 = the held ids during digit switches).
+- All native switches funnel through ONE applier call site `lr=0x820AC1C8` inside
+  `sub_820AAE00` (the weapon state machine), which reads the target from a per-hand
+  "desired weapon" field — a heap struct, which is why fixed-address scans never found it:
+  `hand_struct = *(0x82F1FAAC) + hand*936`; fields: +2344 current id, +2404 desired id,
+  +2384 switch-state (5 = start), +2412 aux (0 on request), +0x94C/+0x950 state counters.
+- **Direct-switch entry: `sub_820A6F70` (guest 0x820A6F70), args r3 = hand, r4 = weapon id,
+  r5 = 1 (direction/mode).** Sole funnel for the Y-cycle input paths (input dispatcher
+  `sub_820B99E8` -> 4 cycle helpers -> 8 call sites total). Dedups repeated requests and
+  refuses to restart an in-flight switch.
+- Forcing alternative one level down: `sub_820A0CF8` (r3=hand, r4=id) = pure 3-store leaf,
+  equivalent to `[H+2404]=id; [H+2412]=0; [H+2384]=5` (write 2384 last). Writing +2404
+  alone does nothing.
+- Confidence: high on formula/protocol (writer enumeration was exhaustive); medium on
+  ownership validation (the entry does NOT check the weapon is held — callers do; our
+  driver guard covers this). Live confirmation = the Phase-2 `equip` harness.
+- Full evidence trail (file:line, guest addresses): `.superpowers/sdd/task-3-analysis.md`
+  (git-ignored scratch; regenerate from generated/ if needed).
+
+### Known limitations (2026-07-03)
+- The direct-call path derives its hand structs from `GE_BONDVIEW_CUR`
+  (0x82F1FAAC), which cycles across all players each frame in a network MP
+  session (the same reason mouse-look migrated to a viewport scan — see
+  `ge_hooks.cpp` ~1320). Network MP sessions are guarded off of the direct path
+  via `GE_NET_FLAG` (byte @0x830CAEA0, !=0 = network MP session) and routed to
+  the pad-injection Y-cycle walker instead, which is player-0-safe by
+  construction.
+- Local splitscreen is **not** detected by `GE_NET_FLAG` and is **untested**
+  with the direct path. If wrong-player weapon switches are reported in
+  splitscreen, the fix is the same viewport-scan player guard idiom already
+  used by mouse-look (`ge_hooks.cpp` ~1320): resolve the acting hand from the
+  active-viewport player instead of `GE_BONDVIEW_CUR`.
+- Single-player is fully verified.

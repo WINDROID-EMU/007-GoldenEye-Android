@@ -24,7 +24,7 @@ and become instant for free.
 
 - No quick-select UI (planned as a follow-on design once switching is instant).
 - No changes to the DS weapon menu or its live-weapon-data offset work.
-- No removal of the Y-cycle path — it remains as the fallback mechanism.
+- No removal of the Y-cycle path — it remains as the cvar-off escape hatch (`ge_weapon_direct_switch=false`).
 
 ## Key facts from prior RE (do not re-litigate)
 
@@ -122,12 +122,16 @@ Per-frame flow in the guest-thread driver (`ge_hooks.cpp`); the request API stay
 3. If cvar `ge_weapon_direct_switch` (default **on**) and the Phase 1 entry exists:
    resolve target if needed, call the guest function, confirm via the equipped-id
    snapshot.
-4. **Fallback:** if the equipped id is unchanged after a confirm window
-   (~30 frames), or the entry was never discovered/compiled out, downgrade that
-   same request to the existing Y-cycle driver. The request is not lost. Log one
-   line per downgrade so degradation is never silent.
+4. **Retry, then give up (AMENDED during implementation, user-approved):** the
+   Phase-2 matrix showed the guest entry silently DROPS requests made while the
+   player is mid-action (e.g. firing) — and a native Y press is equally ignored
+   then, so downgrading to Y-cycle adds nothing. Shipped behavior: if the
+   equipped id is unchanged after a confirm window (~30 frames), RE-ISSUE the
+   direct call (the entry dedups, so repeats are safe), up to 10 tries, then
+   give up and clear the request with one log line. The Y-cycle driver survives
+   intact but is reachable ONLY via `ge_weapon_direct_switch=false`.
 
-The Y-cycle code is kept as-is (no refactor) — the fallback stays boring.
+The Y-cycle code is kept as-is (no refactor) — the escape hatch stays boring.
 `ge_weapon_direct_switch=false` is the A/B lever and per-device escape hatch.
 
 ## Error handling summary
@@ -135,7 +139,7 @@ The Y-cycle code is kept as-is (no refactor) — the fallback stays boring.
 | Failure | Handling |
 |---------|----------|
 | Entry never found (Phase 1 fails) | Phase 0 + cleanups ship alone; Y-cycle remains the mechanism; update the direct-call handoff with the new trail |
-| Call lands but dirty in some player state | Phase 2 "safe to switch" gate defers; confirm-window timeout falls back to Y-cycle |
+| Call lands but dirty in some player state | Shipped: the driver re-issues the direct call every ~30 frames (the entry itself defers/drops while the player is mid-action), up to 10 tries, then gives up and clears with a log line. No automatic Y-cycle fallback; ge_weapon_direct_switch=false is the manual escape hatch. |
 | Call crashes | Must be caught in Phase 2 behind the diag harness; nothing ships enabled-by-default until the matrix is green |
 
 ## Testing (manual, per phase, desktop)
@@ -157,3 +161,23 @@ No unit harness exists for guest-memory behavior and building one is out of scop
 - Build: `cmake --build --preset linux-amd64-relwithdebinfo --target ge`
 - Run binary is `out/build/linux-amd64-relwithdebinfo/GoldenEye` (**not** `ge`):
   `LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets --ge_gamestate_diag=true`
+
+## Verification log (Phase 2 safety matrix)
+Date: 2026-07-03  Build: commits through `03e4629` (branch `feat/weapon-direct-switch`)
+Case results: 1:pass (idle, instant, draw anim correct) 2:pass (request dropped while
+firing, retried automatically, lands cleanly on release) 3:pass (mid-reload) 4:pass
+(dual grant + dual→single via the pair-call, both hands correct, no revert) 5:pass
+(same-id no-op) 6:pass (rapid two ids, last one wins, no corruption) 7:record-only
+(unheld id is granted by the raw guest entry, usually at 0 ammo — the driver's
+held-mask guard is what protects the integrated `RequestEquipWeapon` path from this).
+
+## Integrated desktop verification log (Phase 3)
+Date: 2026-07-03  Build: commits through `03e4629`
+All-pass through the real `RequestEquipWeapon` consumers (digit keys, scrollwheel,
+DS-menu path): (1) digits — instant both directions, including jumps that land on a
+dual-wield entry (accepted as intended UX); (2) scrollwheel — instant both directions
+(next/prev), required the SDK GTK discrete-scroll fix (rexglue `fix/gtk-discrete-scroll`
+@ `e84b8b7`) to arm at all; (3) fire-blocked switches land cleanly on trigger release
+via the retry loop; (4) mid-reload switch OK; (5) dual-wield dwell stable, no revert to
+unarmed; (6) `ge_weapon_direct_switch=false` — Y-cycle fallback still functional
+(confirmed unreliable-by-cycling as expected, which is why it was replaced).

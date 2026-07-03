@@ -1,8 +1,17 @@
 # Handoff: desktop scrollwheel + number-key weapon selection
 
-**Status (2026-07-03):** Task 1 (actuation) DONE, verified on desktop, and shipped
-in prerelease `v1.3.0-android.3`. Tasks 2–4 not started. A few non-blocking
-review cleanups on Task 1 are queued (below).
+**Status (2026-07-03):** Task 1 (actuation) DONE, verified on desktop, shipped
+in prerelease `v1.3.0-android.3`; its review cleanups are also DONE (folded into
+the `feat/weapon-direct-switch` branch's Phase 0). Old Task 2 (number keys 1–9 +
+scrollwheel next/prev) SHIPPED — the wheel required an SDK fix: GTK discrete
+scroll events carried no smooth delta and were silently dropped, fixed on
+rexglue branch `fix/gtk-discrete-scroll` @ `e84b8b7` (PAIRED with this game
+branch — ship/merge together). The direct-call optimization (instant switching
+via the guest function, formerly "deferred") is also DONE — see
+`docs/HANDOFF-weapon-switch-direct-call.md` and
+`docs/superpowers/specs/2026-07-03-weapon-direct-switch-design.md`. Old Tasks
+3–4 (numbered overlay + pause-menu toggle) remain **open**, deferred to a
+future quick-select UI design now that switching itself is instant.
 
 **Goal:** switch weapons on **desktop** with the mouse scrollwheel (next/prev) and
 number keys 1–9 (jump to the Nth carried weapon), with a numbered on-screen
@@ -58,23 +67,20 @@ From the task review (all in the Task 1 code):
    counters aren't reset when a new target is posted mid-cycle.
 
 ## Remaining tasks (see the plan for full step-by-step)
-- **Task 2 — desktop input driver** (`src/ge_hooks.cpp`): remove the temp N block
-  (currently `#if 0`); poll `"WheelUp"`/`"WheelDown"` (SDK synthetic keys, via
-  `ge_key_down`) for next/prev and digit keys 1–9 for jump-to-Nth-held, all
-  edge-triggered, computing a target and calling `RequestEquipWeapon`. New cvars:
-  `ge_weapon_select_enable` (default **on**), `ge_key_wpn_next` (`"WheelUp"`),
-  `ge_key_wpn_prev` (`"WheelDown"`). Numbers map to held-list position.
-- **Task 3 — numbered overlay** (`FpsOverlay` pattern): a bottom-left ImGui
-  overlay on the main window listing carried weapons with the equipped one
-  highlighted; cvar `ge_weapon_overlay` (default **off**). Factor `WeaponLabel`
-  into a shared unit (`src/ge_weapons.{h,cpp}`) used by both the overlay and the
-  existing `WeaponMenuDialog`. Register new `.cpp`s in `CMakeLists.txt`.
-- **Task 4 — pause-menu toggle** for `ge_weapon_overlay` in `src/ge_menu.cpp`
-  (hand-authored menu; use the `GetCvarB`/`SetCvarB` pattern next to the existing
-  second-screen weapon-menu checkbox).
+- **Task 2 — desktop input driver — SHIPPED.** `src/ge_hooks.cpp` polls
+  `"WheelUp"`/`"WheelDown"` (SDK synthetic keys, via `ge_key_down`) for next/prev
+  and digit keys 1–9 for jump-to-Nth-held, all edge-triggered, computing a
+  target and calling `RequestEquipWeapon`. Cvars: `ge_weapon_select_enable`
+  (default **on**), `ge_key_wpn_next` (`"WheelUp"`), `ge_key_wpn_prev`
+  (`"WheelDown"`). Numbers map to held-list position. The wheel required the
+  SDK GTK discrete-scroll fix noted in the Status block above before it worked.
+- **Task 3 — numbered overlay** (`FpsOverlay` pattern) and **Task 4 —
+  pause-menu toggle** for it — **still open**, deferred to a future quick-select
+  UI design (now that the underlying switch is instant, a jump-to-N overlay is
+  more attractive than when it required visible cycling).
 
-Each task ends with a manual on-desktop verification (build → run → observe);
-there is no unit-test harness for guest-memory / ImGui behavior here.
+Each shipped task was verified with a manual on-desktop pass (build → run →
+observe); there is no unit-test harness for guest-memory / ImGui behavior here.
 
 ## Build / run gotchas
 - Build: `cmake --build --preset linux-amd64-relwithdebinfo --target ge`.
@@ -83,11 +89,17 @@ there is no unit-test harness for guest-memory / ImGui behavior here.
   wrong; this also bit `cut-release.sh` (fixed, `57900c1`).
 - Run: `LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets`
   (append cvars like `--log_level debug`, `--ge_gamestate_diag=true`).
+- **Codegen recipe was stale (README/plan both wrong):** after editing
+  `ge_config.toml`/`ge_manifest.toml`, rebuild the sibling rexglue CLI first if
+  it's stale, then run
+  `REX_MAX_JUMP_TABLE_ENTRIES=2048 ../GoldenEye-Recomp-rexglue/out/linux-amd64/rexglue codegen ge_manifest.toml`
+  — entry point is `ge_manifest.toml` (not `ge_config.toml`), and the jump-table
+  size is an env var now, not a `--max_jump_table_entries` flag.
 
 ## Discovery tooling (kept, desktop-only, behind `ge_gamestate_diag`)
 The `memscan` scanner in `ge_gamestate.cpp` gained a live `write <ga> <16|32> <val>`
-command (drive via `/tmp/ge_scan.cmd`, output `/tmp/ge_scan.out`). Useful for the
-deferred direct-call RE.
+command (drive via `/tmp/ge_scan.cmd`, output `/tmp/ge_scan.out`). Used for the
+direct-call RE (now shipped; see `docs/HANDOFF-weapon-switch-direct-call.md`).
 
 ## Resuming the SDD flow
 This was executed via `superpowers:subagent-driven-development`. The revised plan

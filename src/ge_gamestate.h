@@ -12,9 +12,9 @@
 //   This bridge owns that boundary. The game thread publishes a thread-safe
 //   `WeaponSnapshot` once per frame from a guest hook (see ge_gamestate.cpp,
 //   pumped from ge_hooks.cpp); any other thread reads a consistent copy via
-//   GetWeaponSnapshot(). Equip requests flow the other way: the UI thread posts
-//   one with RequestEquipWeapon() and the game thread applies it at a safe point
-//   on the next frame.
+//   GetWeaponSnapshot(). Equip requests flow the other way: any thread posts
+//   one with RequestEquipWeapon() and the actuation driver in ge_hooks.cpp
+//   (game thread) walks the game to the target over the following frames.
 //
 // THREAD-SAFETY CONTRACT
 //   - GetWeaponSnapshot()    : callable from ANY thread, lock-free, never blocks,
@@ -82,12 +82,12 @@ struct WeaponSnapshot {
 // internally and still returns a self-consistent (never torn) snapshot.
 WeaponSnapshot GetWeaponSnapshot();
 
-// Requests that the game switch the active weapon to `weapon_id` (an id from the
-// snapshot's held set). Non-blocking: the request is recorded and applied by the
-// game thread on its next frame, and only when it is SAFE to do so (a valid,
-// alive in-game player that is not in a menu/cutscene). Passing a weapon the
-// player does not currently hold is ignored by the apply step. Calling again
-// before the next frame replaces the pending request (last-writer-wins).
+// Requests that the game switch the active weapon to `weapon_id` (an id from
+// the snapshot's held set). Non-blocking: the request is recorded here and
+// actuated by the game-thread driver in ge_hooks.cpp over the following frames.
+// Targets not held per the current snapshot (or with no valid snapshot) are
+// cleared by the driver without switching. Calling again before actuation
+// completes replaces the pending request (last-writer-wins).
 void RequestEquipWeapon(int32_t weapon_id);
 
 // Non-clearing read of the pending equip target (kNoWeapon if none). The
@@ -97,8 +97,20 @@ void RequestEquipWeapon(int32_t weapon_id);
 int32_t PeekEquipRequest();
 void ClearEquipRequest();
 
-// Game-thread per-frame pump. Reads guest memory, publishes a fresh snapshot,
-// and applies any pending equip request. MUST be called only from a guest-thread
+// Diag-only (Phase-2 verification harness): post a weapon id for the driver
+// to switch to via the verified two-hand pair call (see ge_direct_equip in
+// ge_hooks.cpp -- one hook invocation issues sub_820A6F70 for hand 0 AND
+// hand 1 back-to-back, so a single switch clears the off-hand and a
+// dual-wield weapon grants both hands; no separate hand argument needed).
+// TakeDirectEquip returns-and-clears the pending id (kNoWeapon if none).
+// Callable from any thread. No-ops in normal play (only the memscan `equip`
+// command posts).
+void PostDirectEquip(int32_t weapon_id);
+int32_t TakeDirectEquip();
+
+// Game-thread per-frame pump. Reads guest memory and publishes a fresh
+// snapshot. (Equip actuation does NOT happen here -- see the driver in
+// ge_hooks.cpp.) MUST be called only from a guest-thread
 // hook with the live PPC context. `ppc_ctx` is a PPCContext* (passed as void* so
 // this header stays free of generated headers); `guest_base` is the guest
 // virtual membase. See the call site in ge_hooks.cpp.
