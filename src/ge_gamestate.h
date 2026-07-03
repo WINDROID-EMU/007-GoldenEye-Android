@@ -97,6 +97,14 @@ void RequestEquipWeapon(int32_t weapon_id);
 int32_t PeekEquipRequest();
 void ClearEquipRequest();
 
+// Diag-only (Phase-2 verification harness): post a weapon id for the driver to
+// switch to via ONE direct guest call, bypassing the RequestEquipWeapon walk.
+// TakeDirectEquip returns-and-clears the pending id (kNoWeapon if none).
+// Callable from any thread. No-ops in normal play (only the memscan `equip`
+// command posts).
+void PostDirectEquip(int32_t weapon_id);
+int32_t TakeDirectEquip();
+
 // Game-thread per-frame pump. Reads guest memory and publishes a fresh
 // snapshot. (Equip actuation does NOT happen here -- see the driver in
 // ge_hooks.cpp.) MUST be called only from a guest-thread

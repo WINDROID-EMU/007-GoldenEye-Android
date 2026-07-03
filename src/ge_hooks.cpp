@@ -1525,6 +1525,9 @@ REXCVAR_DEFINE_STRING(ge_key_wpn_prev, "WheelDown", "Input/Keybinds", "Previous 
 // left stick / triggers when their keys are held (pad input is preserved).
 void ge_mouse_camera(uint8_t* base);  // defined above
 void ge_apply_ce_data_patches(uint8_t* base);  // ge_ce_patches.cpp
+// Phase-2 verification harness (defined below, next to the discovery hook, so
+// it can share dbg_safe_ld32). See docs/HANDOFF-weapon-switch-direct-call.md.
+bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id);
 
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // Attach the input listener from the controller-poll path too. InitMouseLook()
@@ -1534,7 +1537,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // it attaches early. NB: the keyboard early-return moved BELOW the CE/mouse
   // block so data fixes + mouse-look still run when only the keyboard is off.
   ge_ensure_listener();
-  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
 
   // Apply BeanTools community DATA bug-fixes once, before any level loads its
   // setup/fog/BG data. The data segment is live in guest RAM by the first input
@@ -1558,6 +1561,14 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // the weapon-select block below polls kMouseWheelUp/Down at.
   g_listener.tick_wheel();
   if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
+
+  // Phase-2 verification harness: an `equip <id>` posted from the memscan
+  // command channel fires ONE direct switch, bypassing RequestEquipWeapon, so
+  // the guest call can be exercised and observed in isolation. Diag-only.
+  if (REXCVAR_GET(ge_gamestate_diag)) {
+    const int32_t direct = ge::gamestate::TakeDirectEquip();
+    if (direct != ge::gamestate::kNoWeapon) ge_direct_equip(ctx, base, direct);
+  }
 
   // Weapon actuation: step the game's native Y (weapon-switch) input toward the
   // pending target posted via RequestEquipWeapon. Each Y press starts a switch
@@ -1724,6 +1735,36 @@ void ge_dbg_weapon_apply(PPCRegister& r3, PPCRegister& r4) {
                "obj[0..3]={:#010x},{:#010x},{:#010x},{:#010x} equip={}",
                (uint32_t)ctx->lr, r3.u32, obj, w[0], w[1], w[2], w[3],
                (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
+}
+
+// ===========================================================================
+// Phase-2 verification harness: direct weapon switch. One call into the
+// game's own switch routine (the pause-menu inventory path, discovered in
+// the Phase-1 RE -- see docs/HANDOFF-weapon-switch-direct-call.md "Findings
+// 2026-07"). MUST run on a guest thread inside a midasm hook. Returns false
+// if the entry is not wired (integration then falls back to the Y-cycle
+// walker). The full-context save/restore is required: we are mid-way
+// through ge_inject_keyboard's host hook, and the generated caller resumes
+// from ctx after we return -- a guest call here clobbers volatile
+// registers/lr otherwise.
+// ===========================================================================
+bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id) {
+  const int32_t before = (int32_t)dbg_safe_ld32(base, 0x447f10b0u);  // equipped-id block
+  const PPCContext saved = *ctx;
+
+  // sub_820A6F70(hand, weapon id, direction/mode) -- the sole funnel for the
+  // native Y-cycle input paths (Findings 2026-07). r3 = hand (0 = main hand),
+  // r4 = raw weapon id, r5 = 1 (direction/mode constant observed on all
+  // native call sites).
+  ctx->r3.u32 = 0;                        // hand 0 (main hand)
+  ctx->r4.u32 = (uint32_t)weapon_id;      // raw weapon id (verified: applier takes ids)
+  ctx->r5.u32 = 1;                        // direction/mode; constant 1 on all native paths
+  sub_820A6F70(*ctx, base);
+
+  *ctx = saved;
+  REXKRNL_INFO("GEWPN direct equip id={} equip_before={} equip_after={}",
+               weapon_id, before, (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
+  return true;  // wired; return false above if left unimplemented
 }
 
 // ===========================================================================

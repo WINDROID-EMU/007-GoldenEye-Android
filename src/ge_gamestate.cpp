@@ -513,6 +513,11 @@ void dispatch(uint8_t* base, const char* line) {
     if (!plausible_guest_ptr(ga)) { emit(out, "write @%#010x rejected (implausible)", ga); }
     else { if (w == 4) ST32(base, ga, v); else ST16(base, ga, (uint16_t)v);
            emit(out, "write @%#010x w%d = 0x%x", ga, w, v); }
+  } else if (nf >= 2 && std::strcmp(verb, "equip") == 0) {
+    // Phase-2 harness: one direct-call switch, executed by the guest-thread
+    // driver (ge_hooks.cpp) on its next poll. Watch the log for GEWPN lines.
+    PostDirectEquip((int32_t)num(a));
+    emit(out, "equip id=%d posted (direct-call; grep log for GEWPN)", (int32_t)num(a));
   } else if (nf >= 2 && std::strcmp(verb, "dump") == 0) {
     dump(base, num(a), nf >= 3 ? num(b) : 64u, out);
   } else if (nf >= 3 && std::strcmp(verb, "snapshot") == 0) {
@@ -527,7 +532,7 @@ void dispatch(uint8_t* base, const char* line) {
     emit(out, "snap: valid=%d equipped_id=%d held_count=%d ammo[eq]=%d frame=%u",
          ss.valid, ss.equipped_id, ss.held_count, ammo, ss.frame);
   } else {
-    emit(out, "?? '%s' (find <16|32> v [lo hi] | snapshot lo hi [16|32] | next v | changed|same|dec|inc | ptr32 ga [lo hi] | list [n] | read ga <16|32> | write ga <16|32> v | dump ga [len] | regions | snap | reset)", line);
+    emit(out, "?? '%s' (find <16|32> v [lo hi] | snapshot lo hi [16|32] | next v | changed|same|dec|inc | ptr32 ga [lo hi] | list [n] | read ga <16|32> | write ga <16|32> v | equip id | dump ga [len] | regions | snap | reset)", line);
   }
   if (out) std::fclose(out);
 }
@@ -690,6 +695,14 @@ int32_t PeekEquipRequest() {
 
 void ClearEquipRequest() {
   g_pending_equip.store(0, std::memory_order_release);
+}
+
+std::atomic<int32_t> g_direct_equip{kNoWeapon};
+void PostDirectEquip(int32_t weapon_id) {
+  g_direct_equip.store(weapon_id, std::memory_order_relaxed);
+}
+int32_t TakeDirectEquip() {
+  return g_direct_equip.exchange(kNoWeapon, std::memory_order_relaxed);
 }
 
 void OnFrame(void* ppc_ctx, uint8_t* guest_base) {
