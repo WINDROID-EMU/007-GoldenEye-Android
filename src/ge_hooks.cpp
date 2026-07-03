@@ -1531,7 +1531,7 @@ void ge_mouse_camera(uint8_t* base);  // defined above
 void ge_apply_ce_data_patches(uint8_t* base);  // ge_ce_patches.cpp
 // Phase-2 verification harness (defined below, next to the discovery hook, so
 // it can share dbg_safe_ld32). See docs/HANDOFF-weapon-switch-direct-call.md.
-bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id, int32_t hand);
+bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id);
 
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // Attach the input listener from the controller-poll path too. InitMouseLook()
@@ -1570,9 +1570,8 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // command channel fires ONE direct switch, bypassing RequestEquipWeapon, so
   // the guest call can be exercised and observed in isolation. Diag-only.
   if (REXCVAR_GET(ge_gamestate_diag)) {
-    int32_t hand = 0;
-    const int32_t direct = ge::gamestate::TakeDirectEquip(&hand);
-    if (direct != ge::gamestate::kNoWeapon) ge_direct_equip(ctx, base, direct, hand);
+    const int32_t direct = ge::gamestate::TakeDirectEquip();
+    if (direct != ge::gamestate::kNoWeapon) ge_direct_equip(ctx, base, direct);
   }
 
   // Weapon actuation: step the game's native Y (weapon-switch) input toward the
@@ -1717,6 +1716,54 @@ uint32_t dbg_safe_ld32(uint8_t* base, uint32_t ga) {
   return 0xffffffffu;
 #endif
 }
+
+// Dual-item inventory walk (task-3-analysis-round2.md "Host recipe" / Q1 & Q4):
+// `g = load_be32(GE_BONDVIEW_CUR)` (0x82F1FAAC, the player-hands struct
+// pointer already used elsewhere in this file) heads a circular linked list
+// of carried-item records at `*(g+4744)`. Each node is
+// `{u32 type @+0, u32 idA @+4, u32 idB @+8, u32 next @+12}`; `type==3` is a
+// dual-item record `{3, idA, idB}` (a same-weapon dual, e.g. dual Phantoms,
+// is `{3, 0x0c, 0x0c}`). Returns true and writes the *other* id in the node
+// through `partner_out` iff a dual record containing `weapon_id` is found.
+//
+// Every read goes through dbg_safe_ld32 (fault-safe: returns the 0xffffffff
+// sentinel instead of retrying a SIGSEGV forever) and every pointer is
+// bounds-checked before it is dereferenced, mirroring
+// ge_gamestate.cpp's plausible_guest_ptr idiom -- any sentinel/implausible
+// read anywhere in the walk aborts it and reports "not dual" rather than
+// risk a fault loop. kMaxDualWalk bounds the node count as a second guard
+// against a corrupt/cyclic list that never re-hits `head`.
+constexpr int kMaxDualWalk = 64;
+inline bool ge_plausible_guest_ptr(uint32_t ga) {
+  return ga >= 0x00010000u && ga < 0xFFFF0000u;
+}
+bool ge_find_dual_partner(uint8_t* base, int32_t weapon_id, int32_t* partner_out) {
+  const uint32_t g = dbg_safe_ld32(base, GE_BONDVIEW_CUR);
+  if (g == 0xffffffffu || !ge_plausible_guest_ptr(g)) return false;
+  const uint32_t head = dbg_safe_ld32(base, g + 4744u);
+  if (head == 0xffffffffu || head == 0u || !ge_plausible_guest_ptr(head)) return false;
+  uint32_t node = head;
+  for (int i = 0; i < kMaxDualWalk; ++i) {
+    const uint32_t type = dbg_safe_ld32(base, node + 0u);
+    const uint32_t idA  = dbg_safe_ld32(base, node + 4u);
+    const uint32_t idB  = dbg_safe_ld32(base, node + 8u);
+    const uint32_t next = dbg_safe_ld32(base, node + 12u);
+    if (type == 0xffffffffu || idA == 0xffffffffu || idB == 0xffffffffu ||
+        next == 0xffffffffu) {
+      return false;  // fault mid-walk -- never trust a torn read
+    }
+    if (type == 3u && (static_cast<int32_t>(idA) == weapon_id ||
+                        static_cast<int32_t>(idB) == weapon_id)) {
+      *partner_out = static_cast<int32_t>(
+          static_cast<int32_t>(idA) == weapon_id ? idB : idA);
+      return true;
+    }
+    if (next == 0u || next == head) break;       // list end / one full loop
+    if (!ge_plausible_guest_ptr(next)) break;     // implausible next -- stop
+    node = next;
+  }
+  return false;
+}
 }  // namespace
 
 // ===========================================================================
@@ -1745,34 +1792,59 @@ void ge_dbg_weapon_apply(PPCRegister& r3, PPCRegister& r4) {
 }
 
 // ===========================================================================
-// Phase-2 verification harness: direct weapon switch. One call into the
-// game's own switch routine (the pause-menu inventory path, discovered in
-// the Phase-1 RE -- see docs/HANDOFF-weapon-switch-direct-call.md "Findings
-// 2026-07"). MUST run on a guest thread inside a midasm hook. Returns false
-// if the entry is not wired (integration then falls back to the Y-cycle
-// walker). The full-context save/restore is required: we are mid-way
-// through ge_inject_keyboard's host hook, and the generated caller resumes
-// from ctx after we return -- a guest call here clobbers volatile
-// registers/lr otherwise.
+// Phase-2 verification harness: direct weapon switch -- the verified
+// two-hand pair-call recipe (task-3-analysis-round2.md "Host recipe"). The
+// native Y-cycle helpers never issue a lone hand-0 or hand-1 request; they
+// always request BOTH hands together in the same quantum (sub_820A6F70(0,...)
+// immediately followed by sub_820A6F70(1,...)), which is what arms hand 1's
+// state-5 bypass before hand 0's own swap point can force-clobber it (round-2
+// Q1's "ordering/clobber caveat"). This function reproduces that pairing:
+//   - Single switch: hand 0 <- weapon_id, hand 1 <- 0 (id 0 is an explicit
+//     off-hand clear -- sub_820C0D48's "b==0" rule always passes it), so a
+//     single-weapon switch also clears any stale off-hand weapon.
+//   - Dual grant: if the inventory's dual-item list (walked fault-safe by
+//     ge_find_dual_partner) has a {3, idA, idB} record containing weapon_id,
+//     hand 1 <- the other id in that record (usually == weapon_id), granting
+//     both hands the dual weapon; otherwise hand 1 still gets the explicit
+//     clear above.
+// Always issues the pair and returns true -- the pair-call has no failure
+// mode of its own (sub_820A6F70 has no validation, see round-2 Q2). The bool
+// return is kept for a future compile-out safety switch, not because this
+// can fail today.
+//
+// MUST run on a guest thread inside a midasm hook. The full-context
+// save/restore is required: we are mid-way through ge_inject_keyboard's host
+// hook, and the generated caller resumes from ctx after we return -- a guest
+// call here clobbers volatile registers/lr otherwise. One save covers both
+// calls; there must be no return between them (same-quantum requirement).
 // ===========================================================================
-bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id, int32_t hand) {
+bool ge_direct_equip(PPCContext* ctx, uint8_t* base, int32_t weapon_id) {
   const int32_t before = (int32_t)dbg_safe_ld32(base, 0x447f10b0u);  // equipped-id block
+
+  int32_t partner = 0;
+  const bool dual = ge_find_dual_partner(base, weapon_id, &partner);
+  const int32_t off_hand_id = dual ? partner : 0;
+
   const PPCContext saved = *ctx;
 
   // sub_820A6F70(hand, weapon id, direction/mode) -- the sole funnel for the
-  // native Y-cycle input paths (Findings 2026-07). r3 = hand (0 = main hand,
-  // 1 = off hand -- diag harness arg, used to probe dual-wield behavior),
-  // r4 = raw weapon id, r5 = 1 (direction/mode constant observed on all
-  // native call sites).
-  ctx->r3.u32 = (uint32_t)hand;           // hand (0 = main hand, 1 = off hand)
-  ctx->r4.u32 = (uint32_t)weapon_id;      // raw weapon id (verified: applier takes ids)
-  ctx->r5.u32 = 1;                        // direction/mode; constant 1 on all native paths
+  // native Y-cycle input paths (Findings 2026-07). Both calls land in this
+  // one hook invocation, back-to-back, so hand 1's requested-state is armed
+  // before hand 0's swap point runs.
+  ctx->r3.u32 = 0u;                        // hand 0 = main hand
+  ctx->r4.u32 = (uint32_t)weapon_id;       // raw weapon id (verified: applier takes ids)
+  ctx->r5.u32 = 1u;                        // direction/mode; constant 1 on all native paths
+  sub_820A6F70(*ctx, base);
+
+  ctx->r3.u32 = 1u;                        // hand 1 = off hand
+  ctx->r4.u32 = (uint32_t)off_hand_id;     // dual partner id, or 0 = explicit clear
+  ctx->r5.u32 = 1u;
   sub_820A6F70(*ctx, base);
 
   *ctx = saved;
-  REXKRNL_INFO("GEWPN direct equip id={} hand={} equip_before={} equip_after={}",
-               weapon_id, hand, before, (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
-  return true;  // wired; return false above if left unimplemented
+  REXKRNL_INFO("GEWPN direct equip id={} dual={} equip_before={} equip_after={}",
+               weapon_id, dual, before, (int32_t)dbg_safe_ld32(base, 0x447f10b0u));
+  return true;
 }
 
 // ===========================================================================

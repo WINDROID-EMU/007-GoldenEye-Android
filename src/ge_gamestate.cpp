@@ -514,14 +514,18 @@ void dispatch(uint8_t* base, const char* line) {
     else { if (w == 4) ST32(base, ga, v); else ST16(base, ga, (uint16_t)v);
            emit(out, "write @%#010x w%d = 0x%x", ga, w, v); }
   } else if (nf >= 2 && std::strcmp(verb, "equip") == 0) {
-    // Phase-2 harness: one direct-call switch, executed by the guest-thread
-    // driver (ge_hooks.cpp) on its next poll. Watch the log for GEWPN lines.
-    // Optional hand arg (default 0) lets a live experiment probe dual-wield
-    // behavior of the direct-switch guest call.
-    int32_t hand = nf >= 3 ? (int32_t)num(b) : 0;
-    hand = (hand != 0) ? 1 : 0;
-    PostDirectEquip((int32_t)num(a), hand);
-    emit(out, "equip id=%d hand=%d posted (direct-call; grep log for GEWPN)", (int32_t)num(a), hand);
+    // Phase-2 harness: one direct-call switch (the two-hand pair-call
+    // recipe), executed by the guest-thread driver (ge_hooks.cpp) on its
+    // next poll. Watch the log for GEWPN lines. The old per-call `hand` arg
+    // is retired -- ge_direct_equip now issues both hands' calls itself
+    // (dual-item inventory walk decides the off-hand id) -- so a stray hand
+    // arg from old muscle memory is accepted-but-warned rather than silently
+    // doing something different.
+    if (nf >= 3 && num(b) != 0) {
+      emit(out, "hand arg retired; pair-call handles both hands");
+    }
+    PostDirectEquip((int32_t)num(a));
+    emit(out, "equip id=%d posted (direct-call; grep log for GEWPN)", (int32_t)num(a));
   } else if (nf >= 2 && std::strcmp(verb, "dump") == 0) {
     dump(base, num(a), nf >= 3 ? num(b) : 64u, out);
   } else if (nf >= 3 && std::strcmp(verb, "snapshot") == 0) {
@@ -701,22 +705,15 @@ void ClearEquipRequest() {
   g_pending_equip.store(0, std::memory_order_release);
 }
 
-// Packs (hand, weapon_id) into the single atomic as (hand << 16) | (id &
-// 0xFFFF). Packed values are always >= 0, so kNoWeapon (-1) stays a
-// distinguishable "empty" sentinel.
+// The hand-pairing experiment is over (see ge_direct_equip in ge_hooks.cpp):
+// the driver now always issues both hands' guest calls itself, so this only
+// needs to carry a weapon id.
 std::atomic<int32_t> g_direct_equip{kNoWeapon};
-void PostDirectEquip(int32_t weapon_id, int32_t hand) {
-  const int32_t packed = (hand << 16) | (weapon_id & 0xFFFF);
-  g_direct_equip.store(packed, std::memory_order_relaxed);
+void PostDirectEquip(int32_t weapon_id) {
+  g_direct_equip.store(weapon_id, std::memory_order_relaxed);
 }
-int32_t TakeDirectEquip(int32_t* hand_out) {
-  const int32_t packed = g_direct_equip.exchange(kNoWeapon, std::memory_order_relaxed);
-  if (packed == kNoWeapon) {
-    if (hand_out) *hand_out = 0;
-    return kNoWeapon;
-  }
-  if (hand_out) *hand_out = (packed >> 16) & 0xFFFF;
-  return packed & 0xFFFF;
+int32_t TakeDirectEquip() {
+  return g_direct_equip.exchange(kNoWeapon, std::memory_order_relaxed);
 }
 
 void OnFrame(void* ppc_ctx, uint8_t* guest_base) {
