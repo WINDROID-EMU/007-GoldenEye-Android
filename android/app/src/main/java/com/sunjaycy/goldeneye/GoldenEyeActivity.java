@@ -512,6 +512,63 @@ public class GoldenEyeActivity extends NativeActivity {
         if (hasFocus) {
             hideSystemUi();
         }
+        noteFocusChangeForStormBreaker();
+    }
+
+    // --- IME focus-storm breaker ---------------------------------------------
+    //
+    // The Ayn Thor's vendor InputMethodManagerService has a second-display IME
+    // target loop (updateImeInputAndControlTargetForSecond ping-ponging between
+    // this activity on display 0 and launcher3's SecondaryDisplayLauncher on the
+    // bottom panel): window focus flaps at ~90-140Hz, each flap re-running
+    // startInput. Each round costs fds (input channels, fd-carrying parcels) on
+    // top of Adreno fence fds, so after ~30-60s the process hits EMFILE and dies
+    // on a binder failure dressed up as DeadSystemException (2026-07-04, twice).
+    //
+    // Normal play sees a handful of focus changes total, the storm sees dozens
+    // per second - so on a burst of FOCUS_STORM_THRESHOLD changes inside
+    // FOCUS_STORM_WINDOW_MS, temporarily mark the window ALT_FOCUSABLE_IM. That
+    // takes it out of IME-target selection entirely (startInputAsyncOnWindow-
+    // FocusGain early-outs), starving the vendor loop of its display-0 target so
+    // it settles; the flag is cleared after a cooldown so the soft keyboard
+    // works again. Runs on the main thread (focus callbacks + window flags).
+    private static final int FOCUS_STORM_THRESHOLD = 10;
+    private static final long FOCUS_STORM_WINDOW_MS = 1000;
+    private static final long FOCUS_STORM_COOLDOWN_MS = 10000;
+    private final long[] focusChangeTimes = new long[FOCUS_STORM_THRESHOLD];
+    private int focusChangeIdx;
+    private boolean imeStormDefenseActive;
+    private Handler mainHandler;  // created on first use; ctor needs the main Looper
+
+    private void noteFocusChangeForStormBreaker() {
+        long now = SystemClock.elapsedRealtime();
+        focusChangeTimes[focusChangeIdx] = now;
+        focusChangeIdx = (focusChangeIdx + 1) % FOCUS_STORM_THRESHOLD;
+        if (imeStormDefenseActive) {
+            return;
+        }
+        // After the write+advance, the slot at focusChangeIdx holds the oldest of
+        // the last THRESHOLD changes (0 until the ring has filled once).
+        long oldest = focusChangeTimes[focusChangeIdx];
+        if (oldest != 0 && now - oldest <= FOCUS_STORM_WINDOW_MS) {
+            imeStormDefenseActive = true;
+            Log.w(TAG, "GEIME focus storm: " + FOCUS_STORM_THRESHOLD + " focus changes in "
+                    + (now - oldest) + "ms; engaging FLAG_ALT_FOCUSABLE_IM for "
+                    + FOCUS_STORM_COOLDOWN_MS + "ms");
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
+            if (mainHandler == null) {
+                mainHandler = new Handler(getMainLooper());
+            }
+            mainHandler.postDelayed(this::disengageStormDefense, FOCUS_STORM_COOLDOWN_MS);
+        }
+    }
+
+    private void disengageStormDefense() {
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
+        java.util.Arrays.fill(focusChangeTimes, 0);
+        focusChangeIdx = 0;
+        imeStormDefenseActive = false;
+        Log.i(TAG, "GEIME focus storm defense disengaged (re-arms if the storm resumes)");
     }
 
     @SuppressWarnings("deprecation")
